@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run tests
+        shell: pwsh
+        run: .\scripts\run_tests.ps1 -Python python
+
+  build-windows:
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build Windows app
+        shell: pwsh
+        run: .\scripts\build_windows.ps1 -Python python -InstallDeps
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EHBatchDownloader-windows-x64
+          path: dist_release\EHBatchDownloader-windows-x64.zip
