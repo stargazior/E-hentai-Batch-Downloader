@@ -1077,6 +1077,17 @@ def download_gallery(client: EhClient, gallery: Gallery, args: argparse.Namespac
     safe_print(f"[{detail.gid}] done, downloaded {downloaded} file(s)")
 
 
+def print_batch_summary(total: int, successes: int, failed_gids: List[int]) -> None:
+    if failed_gids:
+        failed_text = ", ".join(str(gid) for gid in failed_gids)
+        safe_print(
+            f"[batch] completed with {len(failed_gids)}/{total} failed gallery/galleries: {failed_text}",
+            file=sys.stderr,
+        )
+        return
+    safe_print(f"[batch] completed successfully: {successes}/{total} gallery/galleries")
+
+
 def run(args: argparse.Namespace) -> int:
     install_builtin_hosts(args.hosts == "builtin")
     cookie_header = parse_cookie_source(args.cookies, Path(args.cookie_file) if args.cookie_file else None)
@@ -1108,25 +1119,36 @@ def run(args: argparse.Namespace) -> int:
 
     workers = max(1, min(args.gallery_workers, len(galleries)))
     if workers == 1:
-        failures = 0
+        successes = 0
+        failed_gids: List[int] = []
         for gallery in galleries:
             if not run_one(gallery):
-                failures += 1
+                failed_gids.append(gallery.gid)
                 if not args.keep_going:
+                    print_batch_summary(len(galleries), successes, failed_gids)
                     return 1
-        return 1 if failures else 0
+            else:
+                successes += 1
+        print_batch_summary(len(galleries), successes, failed_gids)
+        return 1 if failed_gids else 0
 
-    failures = 0
+    successes = 0
+    failed_gids: List[int] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {executor.submit(run_one, gallery): gallery for gallery in galleries}
         for future in concurrent.futures.as_completed(future_map):
+            gallery = future_map[future]
             ok = future.result()
             if not ok:
-                failures += 1
+                failed_gids.append(gallery.gid)
                 if not args.keep_going:
                     executor.shutdown(cancel_futures=True)
+                    print_batch_summary(len(galleries), successes, failed_gids)
                     return 1
-    return 1 if failures else 0
+            else:
+                successes += 1
+    print_batch_summary(len(galleries), successes, failed_gids)
+    return 1 if failed_gids else 0
 
 
 def self_test() -> int:

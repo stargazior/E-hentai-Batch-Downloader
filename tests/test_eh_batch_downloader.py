@@ -208,6 +208,21 @@ class DownloaderParserTests(unittest.TestCase):
             self.assertFalse(downloader.image_exists(target_base, cleanup_invalid=True))
             self.assertFalse(broken.exists())
 
+    def test_batch_summary_reports_failed_gallery_ids(self) -> None:
+        lines = []
+        original_safe_print = downloader.safe_print
+
+        def capture(*values, **_kwargs) -> None:
+            lines.append(" ".join(str(value) for value in values))
+
+        try:
+            downloader.safe_print = capture
+            downloader.print_batch_summary(total=3, successes=2, failed_gids=[101])
+        finally:
+            downloader.safe_print = original_safe_print
+
+        self.assertEqual(lines, ["[batch] completed with 1/3 failed gallery/galleries: 101"])
+
 
 if __name__ == "__main__":
     unittest.main()
