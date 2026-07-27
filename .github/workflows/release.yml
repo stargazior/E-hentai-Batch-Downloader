@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build Windows package
+        shell: pwsh
+        run: .\scripts\build_windows.ps1 -Python python -InstallDeps
+
+      - name: Create release notes
+        shell: pwsh
+        run: |
+          @"
+          Windows build for EHBatchDownloader $env:GITHUB_REF_NAME.
+
+          Highlights:
+          - GUI and CLI batch downloader for E-Hentai / ExHentai.
+          - Search, uploader, tag, category, title contains, and title regex filters.
+          - Cookie file support, proxy options, host mapping, retries, and parallel page downloads.
+          - Image integrity validation for PNG, JPEG, GIF, and WebP downloads.
+          "@ | Set-Content -LiteralPath release-notes.md -Encoding UTF8
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $asset = "dist_release\EHBatchDownloader-windows-x64.zip"
+          if (gh release view $env:TAG_NAME 2>$null) {
+            gh release upload $env:TAG_NAME $asset --clobber
+          } else {
+            gh release create $env:TAG_NAME $asset --title $env:TAG_NAME --notes-file release-notes.md
+          }
