@@ -40,6 +40,17 @@ $PythonExe = Resolve-Python -Requested $Python
 Set-Location $Root
 $env:PYGAME_HIDE_SUPPORT_PROMPT = "1"
 
-& $PythonExe -m py_compile eh_batch_downloader.py eh_batch_gui.py
-& $PythonExe eh_batch_downloader.py --self-test
-& $PythonExe -m unittest discover -s tests
+function Invoke-Checked {
+  param(
+    [string]$FilePath,
+    [string[]]$Arguments
+  )
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "$FilePath $($Arguments -join ' ') exited with code $LASTEXITCODE"
+  }
+}
+
+Invoke-Checked $PythonExe @("-m", "py_compile", "eh_batch_downloader.py", "eh_batch_gui.py")
+Invoke-Checked $PythonExe @("eh_batch_downloader.py", "--self-test")
+Invoke-Checked $PythonExe @("-m", "unittest", "discover", "-s", "tests")

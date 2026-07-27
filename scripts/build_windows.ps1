@@ -53,6 +53,17 @@ $PythonExe = Resolve-Python -Requested $Python
 Set-Location $Root
 $env:PYGAME_HIDE_SUPPORT_PROMPT = "1"
 
+function Invoke-Checked {
+  param(
+    [string]$FilePath,
+    [string[]]$Arguments
+  )
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "$FilePath $($Arguments -join ' ') exited with code $LASTEXITCODE"
+  }
+}
+
 $PythonHome = Split-Path -Parent ([System.IO.Path]::GetFullPath($PythonExe))
 $CondaLibraryBin = Join-Path $PythonHome "Library\bin"
 $PythonDllDir = Join-Path $PythonHome "DLLs"
@@ -61,16 +72,18 @@ if ($PathParts.Count -gt 0) {
   $env:PATH = ($PathParts -join ";") + ";" + $env:PATH
 }
 
-try {
-  & $PythonExe -c "import PyInstaller" | Out-Null
-} catch {
+& $PythonExe -c "import PyInstaller" | Out-Null
+if ($LASTEXITCODE -ne 0) {
   if (-not $InstallDeps) {
     throw "PyInstaller is not installed. Re-run with -InstallDeps or install requirements-build.txt."
   }
-  & $PythonExe -m pip install -r requirements-build.txt
+  Invoke-Checked $PythonExe @("-m", "pip", "install", "-r", "requirements-build.txt")
 }
 
 & $PSScriptRoot\run_tests.ps1 -Python $PythonExe
+if ($LASTEXITCODE -ne 0) {
+  throw "Test script exited with code $LASTEXITCODE"
+}
 
 $BuildRoot = Join-Path $Root "build"
 $WorkPath = Join-Path $BuildRoot "pyinstaller-work"
@@ -121,7 +134,7 @@ foreach ($DllName in $RequiredDlls) {
 
 $PyInstallerArgs += "eh_batch_gui.py"
 
-& $PythonExe @PyInstallerArgs
+Invoke-Checked $PythonExe $PyInstallerArgs
 
 $ZipPath = Join-Path $ReleaseDir "$AppName-windows-x64.zip"
 if (Test-Path $ZipPath) {
