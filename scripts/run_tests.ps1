@@ -8,6 +8,13 @@ $Root = Split-Path -Parent $PSScriptRoot
 function Resolve-Python {
   param([string]$Requested)
   if ($Requested) {
+    if (Test-Path $Requested) {
+      return (Resolve-Path -LiteralPath $Requested).Path
+    }
+    $RequestedCommand = Get-Command $Requested -ErrorAction SilentlyContinue
+    if ($RequestedCommand) {
+      return $RequestedCommand.Source
+    }
     return $Requested
   }
 
