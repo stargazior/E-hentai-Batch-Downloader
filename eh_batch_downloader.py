@@ -23,6 +23,7 @@ import threading
 import time
 import zlib
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from http.client import HTTPException, IncompleteRead
 from html import unescape
 from html.parser import HTMLParser
@@ -67,7 +68,7 @@ META_CHARSET_RE = re.compile(
     re.IGNORECASE,
 )
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.4.0"
 CATEGORY_BITS = {
     "misc": 0x001,
     "doujinshi": 0x002,
@@ -161,6 +162,13 @@ class Gallery:
 
 
 @dataclass
+class GalleryRunResult:
+    gallery: Gallery
+    ok: bool
+    error: Optional[str] = None
+
+
+@dataclass
 class GalleryDetail:
     gid: int
     token: str
@@ -225,6 +233,75 @@ def sanitize_filename(value: str, default: str = "untitled") -> str:
     if not value:
         return default
     return value[:160]
+
+
+def current_time_text() -> str:
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def sanitize_state_name(value: str, default: str = "default") -> str:
+    value = sanitize_filename(value, default)
+    value = SPACE_RE.sub("_", value).strip("._")
+    return (value or default)[:100]
+
+
+def resolve_job_name(args: argparse.Namespace) -> str:
+    explicit = getattr(args, "job_name", None)
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    source_value = getattr(args, "search", None) or getattr(args, "uploader", None) or getattr(args, "tag", None)
+    if source_value:
+        return str(source_value)[:80]
+    url = getattr(args, "url", None)
+    if url:
+        match = GALLERY_RE.search(str(url))
+        if match:
+            return f"gallery-{match.group('gid')}"
+        return "url"
+    return "default"
+
+
+def state_dir_for(output: Path) -> Path:
+    return output / ".eh_batch_state"
+
+
+def latest_state_path(output: Path, job_name: str) -> Path:
+    return state_dir_for(output) / f"{sanitize_state_name(job_name)}-latest.json"
+
+
+def failures_text_path(output: Path, job_name: str) -> Path:
+    return state_dir_for(output) / f"{sanitize_state_name(job_name)}-failures.txt"
+
+
+def history_path(output: Path, job_name: str) -> Path:
+    return state_dir_for(output) / f"{sanitize_state_name(job_name)}-history.jsonl"
+
+
+def gallery_to_dict(gallery: Gallery) -> Dict[str, object]:
+    return {
+        "gid": gallery.gid,
+        "token": gallery.token,
+        "title": gallery.title,
+        "url": gallery.url,
+    }
+
+
+def gallery_from_dict(data: object) -> Gallery:
+    if not isinstance(data, dict):
+        raise ValueError("Invalid gallery record")
+    return Gallery(
+        gid=int(data["gid"]),
+        token=str(data["token"]),
+        title=str(data.get("title") or data["gid"]),
+        url=str(data["url"]),
+    )
+
+
+def write_json_atomic(path: Path, data: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".part")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
 
 
 def append_query(url: str, **items: object) -> str:
@@ -1088,12 +1165,118 @@ def print_batch_summary(total: int, successes: int, failed_gids: List[int]) -> N
     safe_print(f"[batch] completed successfully: {successes}/{total} gallery/galleries")
 
 
+def source_description(args: argparse.Namespace) -> str:
+    if getattr(args, "retry_failed", False):
+        return f"retry-failed:{resolve_job_name(args)}"
+    for key in ("search", "uploader", "tag", "url"):
+        value = getattr(args, key, None)
+        if value:
+            return f"{key}:{value}"
+    return "unknown"
+
+
+def write_run_state(
+    output: Path,
+    job_name: str,
+    started_at: str,
+    source: str,
+    results: List[GalleryRunResult],
+) -> None:
+    finished_at = current_time_text()
+    failed_results = [result for result in results if not result.ok]
+    success_results = [result for result in results if result.ok]
+    state = {
+        "version": 1,
+        "job_name": job_name,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "source": source,
+        "total": len(results),
+        "successes": len(success_results),
+        "failures": len(failed_results),
+        "failed_galleries": [
+            {
+                **gallery_to_dict(result.gallery),
+                "error": result.error or "unknown error",
+            }
+            for result in failed_results
+        ],
+        "successful_galleries": [gallery_to_dict(result.gallery) for result in success_results],
+    }
+    write_json_atomic(latest_state_path(output, job_name), state)
+
+    failure_lines = [
+        f"# job: {job_name}",
+        f"# started_at: {started_at}",
+        f"# finished_at: {finished_at}",
+        f"# failures: {len(failed_results)}/{len(results)}",
+    ]
+    if failed_results:
+        failure_lines.append("# gid\ttitle\turl\terror")
+        for result in failed_results:
+            gallery = result.gallery
+            failure_lines.append(f"{gallery.gid}\t{gallery.title}\t{gallery.url}\t{result.error or 'unknown error'}")
+    else:
+        failure_lines.append("No failed galleries.")
+    failures_text_path(output, job_name).write_text("\n".join(failure_lines) + "\n", encoding="utf-8")
+
+    history_path(output, job_name).parent.mkdir(parents=True, exist_ok=True)
+    with history_path(output, job_name).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
+def load_failed_galleries(output: Path, job_name: str) -> List[Gallery]:
+    path = latest_state_path(output, job_name)
+    if not path.exists():
+        raise ValueError(f"No failure state found for job '{job_name}': {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    failed = data.get("failed_galleries") if isinstance(data, dict) else None
+    if not isinstance(failed, list):
+        raise ValueError(f"Invalid failure state file: {path}")
+    return [gallery_from_dict(item) for item in failed]
+
+
+def print_failure_report(args: argparse.Namespace) -> int:
+    output = Path(args.output)
+    paths = [latest_state_path(output, args.job_name)] if args.job_name else sorted(state_dir_for(output).glob("*-latest.json"))
+    if not paths:
+        safe_print(f"No state files found in {state_dir_for(output)}")
+        return 0
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            safe_print(f"{path}: failed to read: {exc}", file=sys.stderr)
+            continue
+        failed = data.get("failed_galleries") if isinstance(data, dict) else []
+        if not isinstance(failed, list):
+            failed = []
+        safe_print(
+            f"{data.get('job_name', path.stem)}\t{data.get('failures', len(failed))}/"
+            f"{data.get('total', '?')} failed\t{path}"
+        )
+        for item in failed:
+            gallery = gallery_from_dict(item)
+            error = item.get("error", "") if isinstance(item, dict) else ""
+            safe_print(f"  {gallery.gid}\t{gallery.title}\t{gallery.url}\t{error}")
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
     install_builtin_hosts(args.hosts == "builtin")
+    output = Path(args.output)
+    job_name = resolve_job_name(args)
+    started_at = current_time_text()
     cookie_header = parse_cookie_source(args.cookies, Path(args.cookie_file) if args.cookie_file else None)
     client = EhClient.from_args(args, cookie_header)
-    start_url = client.list_url_from_args(args)
-    galleries = [gallery for gallery in client.iter_galleries(start_url, args.max_list_pages) if matches_gallery(gallery, args)]
+    if args.retry_failed:
+        galleries = load_failed_galleries(output, job_name)
+        safe_print(f"[batch] retrying {len(galleries)} failed gallery/galleries for job '{job_name}'")
+    else:
+        start_url = client.list_url_from_args(args)
+        galleries = [
+            gallery for gallery in client.iter_galleries(start_url, args.max_list_pages) if matches_gallery(gallery, args)
+        ]
     if args.max_galleries:
         galleries = galleries[: args.max_galleries]
 
@@ -1104,32 +1287,40 @@ def run(args: argparse.Namespace) -> int:
         return 0
 
     if not galleries:
+        if args.retry_failed:
+            safe_print(f"No failed galleries found for job '{job_name}'")
+            return 0
         safe_print("No matching galleries found", file=sys.stderr)
         return 1
 
-    def run_one(gallery: Gallery) -> bool:
+    def run_one(gallery: Gallery) -> GalleryRunResult:
         worker_client = EhClient.from_args(args, cookie_header)
         safe_print(f"[{gallery.gid}] start {gallery.title}")
         try:
             download_gallery(worker_client, gallery, args)
-            return True
+            return GalleryRunResult(gallery=gallery, ok=True)
         except RECOVERABLE_ERRORS as exc:
             safe_print(f"[{gallery.gid}] failed: {exc}", file=sys.stderr)
-            return False
+            return GalleryRunResult(gallery=gallery, ok=False, error=str(exc))
 
     workers = max(1, min(args.gallery_workers, len(galleries)))
+    results: List[GalleryRunResult] = []
     if workers == 1:
         successes = 0
         failed_gids: List[int] = []
         for gallery in galleries:
-            if not run_one(gallery):
+            result = run_one(gallery)
+            results.append(result)
+            if not result.ok:
                 failed_gids.append(gallery.gid)
                 if not args.keep_going:
                     print_batch_summary(len(galleries), successes, failed_gids)
+                    write_run_state(output, job_name, started_at, source_description(args), results)
                     return 1
             else:
                 successes += 1
         print_batch_summary(len(galleries), successes, failed_gids)
+        write_run_state(output, job_name, started_at, source_description(args), results)
         return 1 if failed_gids else 0
 
     successes = 0
@@ -1138,16 +1329,19 @@ def run(args: argparse.Namespace) -> int:
         future_map = {executor.submit(run_one, gallery): gallery for gallery in galleries}
         for future in concurrent.futures.as_completed(future_map):
             gallery = future_map[future]
-            ok = future.result()
-            if not ok:
+            result = future.result()
+            results.append(result)
+            if not result.ok:
                 failed_gids.append(gallery.gid)
                 if not args.keep_going:
                     executor.shutdown(cancel_futures=True)
                     print_batch_summary(len(galleries), successes, failed_gids)
+                    write_run_state(output, job_name, started_at, source_description(args), results)
                     return 1
             else:
                 successes += 1
     print_batch_summary(len(galleries), successes, failed_gids)
+    write_run_state(output, job_name, started_at, source_description(args), results)
     return 1 if failed_gids else 0
 
 
@@ -1261,8 +1455,87 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing image files.")
     parser.add_argument("--keep-going", action="store_true", help="Continue after a gallery fails.")
     parser.add_argument("--dry-run", action="store_true", help="Only list matching galleries.")
+    parser.add_argument("--job-name", help="Persistent job name for state and retry files.")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry failed galleries from the latest job state.")
+    parser.add_argument("--list-failures", action="store_true", help="List latest recorded failures and exit.")
+    parser.add_argument("--task-file", help="JSON task file with multiple saved jobs.")
+    parser.add_argument("--task-name", action="append", dest="task_names", help="Only run matching task name(s).")
+    parser.add_argument("--run-tasks", action="store_true", help="Run enabled tasks from --task-file once.")
+    parser.add_argument("--schedule-tasks", action="store_true", help="Keep running enabled tasks from --task-file on intervals.")
     parser.add_argument("--self-test", action="store_true", help="Run offline parser tests.")
     return parser
+
+
+def load_task_definitions(path: Path) -> List[Dict[str, object]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Failed to read task file {path}: {exc}") from exc
+    tasks = data.get("tasks") if isinstance(data, dict) else data
+    if not isinstance(tasks, list):
+        raise ValueError("Task file must be a JSON array or an object with a 'tasks' array.")
+    normalized: List[Dict[str, object]] = []
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict):
+            raise ValueError(f"Task #{index} must be an object.")
+        name = str(task.get("name") or f"task-{index}").strip()
+        raw_args = task.get("args")
+        if not isinstance(raw_args, list) or not all(isinstance(item, (str, int, float, bool)) for item in raw_args):
+            raise ValueError(f"Task '{name}' must define args as a JSON array.")
+        normalized.append(
+            {
+                "name": name,
+                "enabled": bool(task.get("enabled", True)),
+                "interval_minutes": float(task.get("interval_minutes", 60)),
+                "args": [str(item) for item in raw_args],
+            }
+        )
+    return normalized
+
+
+def run_task_definition(task: Dict[str, object]) -> int:
+    name = str(task["name"])
+    task_args = list(task["args"])  # type: ignore[arg-type]
+    if "--job-name" not in task_args:
+        task_args.extend(["--job-name", name])
+    parser = build_parser()
+    args = parser.parse_args(task_args)
+    if args.self_test or args.run_tasks or args.schedule_tasks:
+        raise ValueError(f"Task '{name}' contains nested control arguments.")
+    safe_print(f"[task:{name}] start")
+    code = print_failure_report(args) if args.list_failures else run(args)
+    safe_print(f"[task:{name}] exit code {code}")
+    return code
+
+
+def run_task_file(path: Path, selected_names: Optional[List[str]], schedule: bool) -> int:
+    tasks = load_task_definitions(path)
+    selected = set(selected_names or [])
+    tasks = [task for task in tasks if task["enabled"] and (not selected or str(task["name"]) in selected)]
+    if not tasks:
+        safe_print("No enabled tasks matched.")
+        return 0
+
+    if not schedule:
+        failures = 0
+        for task in tasks:
+            if run_task_definition(task) != 0:
+                failures += 1
+        return 1 if failures else 0
+
+    next_run = {str(task["name"]): 0.0 for task in tasks}
+    while True:
+        now = time.time()
+        for task in tasks:
+            name = str(task["name"])
+            if now < next_run[name]:
+                continue
+            code = run_task_definition(task)
+            interval = max(1.0, float(task["interval_minutes"])) * 60.0
+            next_run[name] = time.time() + interval
+            safe_print(f"[task:{name}] next run in {interval / 60.0:g} minute(s), last code {code}")
+        sleep_for = max(1.0, min(next_run.values()) - time.time())
+        time.sleep(min(sleep_for, 60.0))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1271,6 +1544,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
+    if args.task_file and (args.run_tasks or args.schedule_tasks):
+        try:
+            return run_task_file(Path(args.task_file), args.task_names, schedule=args.schedule_tasks)
+        except RECOVERABLE_ERRORS as exc:
+            safe_print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    if args.list_failures:
+        return print_failure_report(args)
     try:
         return run(args)
     except RECOVERABLE_ERRORS as exc:

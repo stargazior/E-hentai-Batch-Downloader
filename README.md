@@ -102,6 +102,46 @@ C:\Users\hoshizora\.conda\envs\pytorch\python.exe .\eh_batch_downloader.py --sea
 
 GUI 中默认全选全部大类；如果只要 Doujinshi、Manga、Non-H，可以点 `Doujinshi/Manga/Non-H` 快捷按钮。
 
+## 任务状态和失败重试
+
+建议给长期任务设置稳定的 `Job Name`，例如 `touhou-baiyang-nonh`。每次非 dry-run 下载结束后，程序会在输出目录写入：
+
+```text
+.eh_batch_state\<job>-latest.json
+.eh_batch_state\<job>-failures.txt
+.eh_batch_state\<job>-history.jsonl
+```
+
+`latest.json` 供程序读取，`failures.txt` 方便人直接查看，`history.jsonl` 用来保留每次运行记录。
+
+只重试上次失败的 gallery：
+
+```powershell
+C:\Users\hoshizora\.conda\envs\pytorch\python.exe .\eh_batch_downloader.py --retry-failed --job-name touhou-baiyang-nonh --output F:\eh_downloads --cookie-file .\eh_cookies.txt --keep-going
+```
+
+查看所有任务最近失败：
+
+```powershell
+C:\Users\hoshizora\.conda\envs\pytorch\python.exe .\eh_batch_downloader.py --list-failures --output F:\eh_downloads
+```
+
+## 多任务运行
+
+可以参考 `tasks.example.json` 建立自己的任务文件，每个任务负责一种搜索条件或分类。运行所有 enabled 任务一次：
+
+```powershell
+C:\Users\hoshizora\.conda\envs\pytorch\python.exe .\eh_batch_downloader.py --task-file .\tasks.json --run-tasks
+```
+
+也可以让程序常驻并按任务里的 `interval_minutes` 循环：
+
+```powershell
+C:\Users\hoshizora\.conda\envs\pytorch\python.exe .\eh_batch_downloader.py --task-file .\tasks.json --schedule-tasks
+```
+
+更稳的长期方案是用 Windows 任务计划程序定时调用 `--run-tasks`，程序只负责每次执行和记录状态。
+
 ## Title Regex 例子
 
 `Title Regex` 使用 Python 正则，匹配的是 Preview 日志里显示的标题。

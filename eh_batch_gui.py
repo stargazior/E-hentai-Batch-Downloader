@@ -58,6 +58,7 @@ class BatchDownloaderGui(tk.Tk):
         self.max_list_pages = tk.StringVar(value="1")
         self.max_galleries = tk.StringVar(value="0")
         self.max_image_pages = tk.StringVar(value="0")
+        self.job_name = tk.StringVar(value="default")
         self.output_dir = tk.StringVar(value=default_output_dir())
         self.cookie_file = tk.StringVar()
         self.cookie_text = tk.StringVar()
@@ -212,12 +213,15 @@ class BatchDownloaderGui(tk.Tk):
         ttk.Entry(paths, textvariable=self.output_dir).grid(row=0, column=1, sticky="ew", pady=4)
         ttk.Button(paths, text="Browse", command=self._choose_output).grid(row=0, column=2, padx=(8, 0), pady=4)
 
-        ttk.Label(paths, text="Cookie File").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(paths, textvariable=self.cookie_file).grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Button(paths, text="Browse", command=self._choose_cookie_file).grid(row=1, column=2, padx=(8, 0), pady=4)
+        ttk.Label(paths, text="Job Name").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(paths, textvariable=self.job_name).grid(row=1, column=1, sticky="ew", pady=4)
 
-        ttk.Label(paths, text="Cookie Header").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
-        ttk.Entry(paths, textvariable=self.cookie_text, show="*").grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Label(paths, text="Cookie File").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(paths, textvariable=self.cookie_file).grid(row=2, column=1, sticky="ew", pady=4)
+        ttk.Button(paths, text="Browse", command=self._choose_cookie_file).grid(row=2, column=2, padx=(8, 0), pady=4)
+
+        ttk.Label(paths, text="Cookie Header").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Entry(paths, textvariable=self.cookie_text, show="*").grid(row=3, column=1, sticky="ew", pady=4)
 
         buttons = ttk.Frame(self, padding=(12, 0, 12, 8))
         buttons.grid(row=4, column=0, sticky="ew")
@@ -227,10 +231,16 @@ class BatchDownloaderGui(tk.Tk):
         self.preview_button.grid(row=0, column=0, padx=(0, 8))
         self.start_button = ttk.Button(buttons, text="Start Download", command=lambda: self._start_process(dry_run=False))
         self.start_button.grid(row=0, column=1, padx=(0, 8))
+        self.retry_button = ttk.Button(
+            buttons,
+            text="Retry Failed",
+            command=lambda: self._start_process(dry_run=False, retry_failed=True),
+        )
+        self.retry_button.grid(row=0, column=2, padx=(0, 8))
         self.stop_button = ttk.Button(buttons, text="Stop", command=self._stop_process, state="disabled")
-        self.stop_button.grid(row=0, column=2, padx=(0, 8))
-        ttk.Button(buttons, text="Clear Log", command=self._clear_log).grid(row=0, column=3, padx=(0, 8))
-        ttk.Button(buttons, text="Self Test", command=self._run_self_test).grid(row=0, column=4, padx=(0, 8))
+        self.stop_button.grid(row=0, column=3, padx=(0, 8))
+        ttk.Button(buttons, text="Clear Log", command=self._clear_log).grid(row=0, column=4, padx=(0, 8))
+        ttk.Button(buttons, text="Self Test", command=self._run_self_test).grid(row=0, column=5, padx=(0, 8))
 
         log_frame = ttk.LabelFrame(self, text="Log", padding=8)
         log_frame.grid(row=5, column=0, sticky="nsew", padx=12, pady=(0, 12))
@@ -277,7 +287,12 @@ class BatchDownloaderGui(tk.Tk):
     def _run_self_test(self) -> None:
         self._start_process(dry_run=False, extra_args=["--self-test"])
 
-    def _build_command(self, dry_run: bool, extra_args: list[str] | None = None) -> tuple[list[str], dict[str, str]]:
+    def _build_command(
+        self,
+        dry_run: bool,
+        extra_args: list[str] | None = None,
+        retry_failed: bool = False,
+    ) -> tuple[list[str], dict[str, str]]:
         if not is_frozen_app() and not GUI_SCRIPT.exists():
             raise ValueError(f"GUI script not found: {GUI_SCRIPT}")
 
@@ -289,23 +304,29 @@ class BatchDownloaderGui(tk.Tk):
 
         source_type = self.source_type.get()
         source_value = self.source_value.get().strip()
-        if source_type == "Search":
-            if source_value:
-                cmd.extend(["--search", source_value])
-        elif source_type == "Uploader":
-            if not source_value:
-                raise ValueError("Uploader is required.")
-            cmd.extend(["--uploader", source_value])
-        elif source_type == "Tag":
-            if not source_value:
-                raise ValueError("Tag is required.")
-            cmd.extend(["--tag", source_value])
+        if not retry_failed:
+            if source_type == "Search":
+                if source_value:
+                    cmd.extend(["--search", source_value])
+            elif source_type == "Uploader":
+                if not source_value:
+                    raise ValueError("Uploader is required.")
+                cmd.extend(["--uploader", source_value])
+            elif source_type == "Tag":
+                if not source_value:
+                    raise ValueError("Tag is required.")
+                cmd.extend(["--tag", source_value])
+            else:
+                if not source_value:
+                    raise ValueError("List URL is required.")
+                cmd.extend(["--url", source_value])
         else:
-            if not source_value:
-                raise ValueError("List URL is required.")
-            cmd.extend(["--url", source_value])
+            cmd.append("--retry-failed")
 
         cmd.extend(["--site", "ex" if self.site.get() == "ExHentai" else "e"])
+        job_name = self.job_name.get().strip()
+        if job_name:
+            cmd.extend(["--job-name", job_name])
         cmd.extend(["--max-list-pages", str(parse_positive_int(self.max_list_pages.get(), "List Pages", minimum=1))])
         cmd.extend(["--max-galleries", str(parse_positive_int(self.max_galleries.get(), "Galleries", minimum=0))])
         cmd.extend(["--max-image-pages", str(parse_positive_int(self.max_image_pages.get(), "Image Pages", minimum=0))])
@@ -390,6 +411,7 @@ class BatchDownloaderGui(tk.Tk):
             "max_list_pages": self.max_list_pages.get(),
             "max_galleries": self.max_galleries.get(),
             "max_image_pages": self.max_image_pages.get(),
+            "job_name": self.job_name.get(),
             "output_dir": self.output_dir.get(),
             "cookie_file": self.cookie_file.get(),
             "timeout": self.timeout.get(),
@@ -428,6 +450,7 @@ class BatchDownloaderGui(tk.Tk):
             "max_list_pages": self.max_list_pages,
             "max_galleries": self.max_galleries,
             "max_image_pages": self.max_image_pages,
+            "job_name": self.job_name,
             "output_dir": self.output_dir,
             "cookie_file": self.cookie_file,
             "timeout": self.timeout,
@@ -481,12 +504,17 @@ class BatchDownloaderGui(tk.Tk):
             self.process.terminate()
         self.destroy()
 
-    def _start_process(self, dry_run: bool, extra_args: list[str] | None = None) -> None:
+    def _start_process(
+        self,
+        dry_run: bool,
+        extra_args: list[str] | None = None,
+        retry_failed: bool = False,
+    ) -> None:
         if self.process and self.process.poll() is None:
             messagebox.showinfo("Running", "A task is already running.")
             return
         try:
-            cmd, env = self._build_command(dry_run=dry_run, extra_args=extra_args)
+            cmd, env = self._build_command(dry_run=dry_run, extra_args=extra_args, retry_failed=retry_failed)
         except ValueError as exc:
             messagebox.showerror("Invalid Input", str(exc))
             return
@@ -534,6 +562,7 @@ class BatchDownloaderGui(tk.Tk):
         state = "disabled" if running else "normal"
         self.preview_button.configure(state=state)
         self.start_button.configure(state=state)
+        self.retry_button.configure(state=state)
         self.stop_button.configure(state="normal" if running else "disabled")
 
     def _poll_log_queue(self) -> None:

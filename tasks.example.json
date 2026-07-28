@@ -1,0 +1,26 @@
+{
+  "tasks": [
+    {
+      "name": "touhou-baiyang-nonh",
+      "enabled": true,
+      "interval_minutes": 360,
+      "args": [
+        "--search",
+        "language:chinese$ parody:\"touhou project$\"",
+        "--category",
+        "non-h",
+        "--title-contains",
+        "白杨汉化组",
+        "--site",
+        "e",
+        "--max-list-pages",
+        "20",
+        "--output",
+        "F:\\eh_downloads",
+        "--cookie-file",
+        "F:\\WORK\\codex\\eh_cookies.txt",
+        "--keep-going"
+      ]
+    }
+  ]
+}

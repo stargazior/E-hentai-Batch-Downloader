@@ -229,6 +229,58 @@ class DownloaderParserTests(unittest.TestCase):
             "3520844-Shinpan  审判 (Touhou Project)",
         )
 
+    def test_run_state_records_and_loads_failed_galleries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            failed_gallery = downloader.Gallery(
+                gid=101,
+                token="bcdefa2345",
+                title="Failed Gallery",
+                url="https://e-hentai.org/g/101/bcdefa2345/",
+            )
+            results = [
+                downloader.GalleryRunResult(
+                    gallery=downloader.Gallery(
+                        gid=100,
+                        token="abcdef1234",
+                        title="OK Gallery",
+                        url="https://e-hentai.org/g/100/abcdef1234/",
+                    ),
+                    ok=True,
+                ),
+                downloader.GalleryRunResult(gallery=failed_gallery, ok=False, error="network down"),
+            ]
+
+            downloader.write_run_state(output, "touhou", "2026-07-28T00:00:00+08:00", "search:touhou", results)
+
+            loaded = downloader.load_failed_galleries(output, "touhou")
+            self.assertEqual([gallery.gid for gallery in loaded], [101])
+            self.assertTrue((output / ".eh_batch_state" / "touhou-failures.txt").exists())
+
+    def test_task_file_accepts_multiple_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            task_file = Path(temp_dir) / "tasks.json"
+            task_file.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "name": "touhou",
+                                "enabled": True,
+                                "interval_minutes": 30,
+                                "args": ["--search", "touhou", "--output", "F:\\eh_downloads"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            tasks = downloader.load_task_definitions(task_file)
+
+            self.assertEqual(tasks[0]["name"], "touhou")
+            self.assertEqual(tasks[0]["args"], ["--search", "touhou", "--output", "F:\\eh_downloads"])
+
 
 if __name__ == "__main__":
     unittest.main()
