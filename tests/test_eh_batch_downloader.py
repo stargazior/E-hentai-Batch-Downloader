@@ -223,10 +223,10 @@ class DownloaderParserTests(unittest.TestCase):
 
         self.assertEqual(lines, ["[batch] completed with 1/3 failed gallery/galleries: 101"])
 
-    def test_sanitize_filename_replaces_windows_invalid_chars_with_spaces(self) -> None:
+    def test_sanitize_filename_removes_windows_invalid_chars(self) -> None:
         self.assertEqual(
             downloader.sanitize_filename("3520844-Shinpan | 审判 (Touhou Project)"),
-            "3520844-Shinpan   审判 (Touhou Project)",
+            "3520844-Shinpan  审判 (Touhou Project)",
         )
 
 

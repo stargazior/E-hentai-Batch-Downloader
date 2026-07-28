@@ -67,7 +67,7 @@ META_CHARSET_RE = re.compile(
     re.IGNORECASE,
 )
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.4"
 CATEGORY_BITS = {
     "misc": 0x001,
     "doujinshi": 0x002,
@@ -220,7 +220,7 @@ def strip_tags(value: str) -> str:
 
 def sanitize_filename(value: str, default: str = "untitled") -> str:
     value = strip_tags(value)
-    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", value)
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", value)
     value = value.rstrip(" .")
     if not value:
         return default
