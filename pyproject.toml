@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "eh-batch-downloader"
-version = "0.4.0"
+version = "0.6.5"
 description = "Standalone batch downloader GUI/CLI for E-Hentai and ExHentai."
 readme = "README.md"
 requires-python = ">=3.10"

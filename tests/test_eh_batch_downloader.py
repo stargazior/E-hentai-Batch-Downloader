@@ -1,8 +1,10 @@
 import argparse
+import io
 import json
 import struct
 import tempfile
 import unittest
+import zipfile
 import zlib
 from http.client import IncompleteRead
 from pathlib import Path
@@ -18,6 +20,74 @@ def tiny_png() -> bytes:
     ihdr = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
     idat = zlib.compress(b"\x00\x00\x00\x00")
     return b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", ihdr) + png_chunk(b"IDAT", idat) + png_chunk(b"IEND", b"")
+
+
+def write_tiny_zip(path: Path) -> None:
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("00000001.jpg", b"not a real image but a valid zip member")
+
+
+def make_stored_zip_bytes(size: int = 3 * 1024 * 1024) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("payload.bin", b"x" * size)
+    return buffer.getvalue()
+
+
+class FakeBinaryResponse:
+    def __init__(self, url: str, status: int, body: bytes, headers: dict[str, str]) -> None:
+        self.url = url
+        self.status = status
+        self.headers = headers
+        self._body = io.BytesIO(body)
+        self.read_sizes: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:
+        self.read_sizes.append(size)
+        return self._body.read(size)
+
+    def geturl(self) -> str:
+        return self.url
+
+    def __enter__(self) -> "FakeBinaryResponse":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+
+class FakeRangeOpener:
+    def __init__(self, body: bytes, supports_range: bool = True) -> None:
+        self.body = body
+        self.supports_range = supports_range
+        self.range_downloads = 0
+        self.full_downloads = 0
+        self.responses: list[FakeBinaryResponse] = []
+
+    def open(self, request, timeout=None):
+        range_header = request.get_header("Range")
+        if range_header and self.supports_range:
+            start_text, end_text = range_header.replace("bytes=", "").split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            chunk = self.body[start : end + 1]
+            if start == 0 and end == 0:
+                headers = {"Content-Range": f"bytes 0-0/{len(self.body)}", "Content-Length": "1"}
+                response = FakeBinaryResponse(request.full_url, 206, chunk, headers)
+                self.responses.append(response)
+                return response
+            self.range_downloads += 1
+            headers = {
+                "Content-Range": f"bytes {start}-{end}/{len(self.body)}",
+                "Content-Length": str(len(chunk)),
+            }
+            response = FakeBinaryResponse(request.full_url, 206, chunk, headers)
+            self.responses.append(response)
+            return response
+        self.full_downloads += 1
+        response = FakeBinaryResponse(request.full_url, 200, self.body, {"Content-Length": str(len(self.body))})
+        self.responses.append(response)
+        return response
 
 
 class DownloaderParserTests(unittest.TestCase):
@@ -67,6 +137,70 @@ class DownloaderParserTests(unittest.TestCase):
         self.assertEqual(info.skip_hath_key, "skip123")
         self.assertIn("fullimg", info.origin_image_url or "")
 
+    def test_prompt_copy_url_is_not_treated_as_original_image(self) -> None:
+        page_html = """
+        <script>var showkey="show123";</script>
+        <img id="img" src="https://ehgt.org/full/001.webp" style="max-width:100%">
+        <a onclick="return nl('skip123')">skip</a>
+        <a href="#" onclick="prompt('Copy the URL below.', 'https://e-hentai.org/r/bad/100-1/001.png')">
+        """
+
+        info = downloader.parse_page_html(page_html)
+
+        self.assertEqual(info.image_url, "https://ehgt.org/full/001.webp")
+        self.assertIsNone(info.origin_image_url)
+
+    def test_archive_info_parsing_separates_original_and_resample(self) -> None:
+        html = """
+        <div>Funds: 9,999 GP</div>
+        <p>Download Cost: <strong>Free!</strong></p>
+        <form action="/archiver.php?gid=100&amp;token=abcdef1234&amp;or=abc" method="post">
+          <input type="hidden" name="dltype" value="org">
+          <input type="submit" name="dlcheck" value="Download Original Archive">
+        </form>
+        <p>Estimated Size: <strong>18.46 MiB</strong></p>
+        <p>Download Cost: <strong>20 GP</strong></p>
+        <form action="/archiver.php?gid=100&amp;token=abcdef1234&amp;or=def" method="post">
+          <input type="hidden" name="dltype" value="res">
+          <input type="submit" name="dlcheck" value="Download Resample Archive">
+        </form>
+        <p>Estimated Size: <strong>8.00 MiB</strong></p>
+        """
+
+        archive_info = downloader.parse_archive_info(
+            html,
+            "https://e-hentai.org/archiver.php?gid=100&token=abcdef1234",
+        )
+
+        self.assertIsNotNone(archive_info.original)
+        self.assertIsNotNone(archive_info.resample)
+        assert archive_info.original is not None
+        assert archive_info.resample is not None
+        self.assertEqual(archive_info.original.cost, "Free!")
+        self.assertEqual(archive_info.original.size, "18.46 MiB")
+        self.assertEqual(archive_info.resample.cost, "20 GP")
+        self.assertEqual(archive_info.resample.size, "8.00 MiB")
+        self.assertEqual(
+            archive_info.original.url,
+            "https://e-hentai.org/archiver.php?gid=100&token=abcdef1234&or=abc",
+        )
+
+    def test_archive_redirect_and_download_link_parsing(self) -> None:
+        self.assertEqual(
+            downloader.parse_archive_continue_url(
+                'document.location = "/archiver.php?gid=100&next=1";',
+                "https://e-hentai.org/archiver.php",
+            ),
+            "https://e-hentai.org/archiver.php?gid=100&next=1",
+        )
+        self.assertEqual(
+            downloader.parse_archive_final_download_url(
+                '<a href="/archive.zip">Click Here To Start Downloading</a>',
+                "https://e-hentai.org/archiver.php",
+            ),
+            "https://e-hentai.org/archive.zip",
+        )
+
     def test_response_decode_preserves_chinese_title(self) -> None:
         raw = '<a href="/g/102/cdefab3456/">[中文翻译] [白杨汉化组]</a>'.encode("gb18030")
 
@@ -108,6 +242,55 @@ class DownloaderParserTests(unittest.TestCase):
             )
         )
 
+    def test_title_filters_support_any_and_all(self) -> None:
+        gallery = downloader.Gallery(
+            gid=4078149,
+            token="9e1a06a282",
+            title="(C86) [Uminoie Hamanasu] SPiCE!! (Touhou Project) [中文翻译] [白杨汉化组]",
+            url="https://e-hentai.org/g/4078149/9e1a06a282/",
+        )
+
+        self.assertTrue(
+            downloader.matches_gallery(
+                gallery,
+                argparse.Namespace(title_contains=["中文翻译", "白杨汉化组"], title_regex=None, title_match="all"),
+            )
+        )
+        self.assertFalse(
+            downloader.matches_gallery(
+                gallery,
+                argparse.Namespace(title_contains=["不存在", "白杨汉化组"], title_regex=None, title_match="all"),
+            )
+        )
+        self.assertTrue(
+            downloader.matches_gallery(
+                gallery,
+                argparse.Namespace(title_contains=["不存在", "白杨汉化组"], title_regex=None, title_match="any"),
+            )
+        )
+        self.assertTrue(
+            downloader.matches_gallery(
+                gallery,
+                argparse.Namespace(title_contains=["白杨汉化组"], title_regex=[r"Touhou"], title_match="all"),
+            )
+        )
+        self.assertTrue(
+            downloader.matches_gallery(
+                gallery,
+                argparse.Namespace(title_contains=["不存在"], title_regex=[r"Touhou"], title_match="any"),
+            )
+        )
+
+    def test_mixed_server_conditions_are_supported(self) -> None:
+        args = downloader.build_parser().parse_args(
+            ["--uploader", "alice", "--tag", "language:chinese$", "--source-match", "all"]
+        )
+        urls = downloader.EhClient.from_args(args, "").list_urls_from_args(args)
+
+        self.assertEqual(len(urls), 2)
+        self.assertIn("/uploader/alice", urls[0])
+        self.assertIn("/tag/language%3Achinese%24", urls[1])
+
     def test_cookie_file_formats(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp = Path(temp_dir)
@@ -138,6 +321,13 @@ class DownloaderParserTests(unittest.TestCase):
         self.assertEqual(args.delay, 0.0)
         self.assertEqual(args.gallery_workers, 1)
         self.assertEqual(args.page_workers, 3)
+        self.assertEqual(args.download_mode, "pages")
+        self.assertEqual(args.archive_connections, downloader.DEFAULT_ARCHIVE_CONNECTIONS)
+
+    def test_content_range_and_split_ranges(self) -> None:
+        self.assertEqual(downloader.parse_content_range_total("bytes 0-0/12345"), 12345)
+        self.assertIsNone(downloader.parse_content_range_total("bytes 0-0/*"))
+        self.assertEqual(downloader.split_ranges(10, 3, min_part_size=1), [(0, 3), (4, 6), (7, 9)])
 
     def test_incomplete_read_is_retryable_network_error(self) -> None:
         exc = IncompleteRead(b"partial", 10)
@@ -166,12 +356,93 @@ class DownloaderParserTests(unittest.TestCase):
         self.assertIn("f_cats=761", url)
         self.assertIn("language%3Achinese%24", url)
 
+    def test_multiple_uploaders_are_union_source_urls(self) -> None:
+        args = downloader.build_parser().parse_args(["--uploader", "alice", "--uploader", "bob"])
+        client = downloader.EhClient.from_args(args, "")
+
+        urls = client.list_urls_from_args(args)
+
+        self.assertEqual(len(urls), 2)
+        self.assertIn("/uploader/alice", urls[0])
+        self.assertIn("/uploader/bob", urls[1])
+
+    def test_multiple_uploader_all_returns_source_urls_for_intersection(self) -> None:
+        args = downloader.build_parser().parse_args(
+            ["--uploader", "alice", "--uploader", "bob", "--source-match", "all"]
+        )
+        client = downloader.EhClient.from_args(args, "")
+
+        urls = client.list_urls_from_args(args)
+
+        self.assertEqual(len(urls), 2)
+        self.assertIn("/uploader/alice", urls[0])
+        self.assertIn("/uploader/bob", urls[1])
+
+    def test_multiple_tags_can_be_intersected_as_all_sources(self) -> None:
+        args = downloader.build_parser().parse_args(
+            ["--tag", "language:chinese$", "--tag", 'parody:"touhou project$"', "--source-match", "all"]
+        )
+        client = downloader.EhClient.from_args(args, "")
+
+        urls = client.list_urls_from_args(args)
+
+        self.assertEqual(len(urls), 2)
+        self.assertIn("/tag/language%3Achinese%24", urls[0])
+        self.assertIn("/tag/parody%3A%22touhou%20project%24%22", urls[1])
+
     def test_category_names_can_be_comma_separated_or_raw_f_cats(self) -> None:
         comma_args = downloader.build_parser().parse_args(["--search", "touhou", "--category", "doujinshi,manga,non h"])
         self.assertEqual(downloader.resolve_f_cats(comma_args), 761)
 
         raw_args = downloader.build_parser().parse_args(["--search", "touhou", "--category", "761"])
         self.assertEqual(downloader.resolve_f_cats(raw_args), 761)
+
+    def test_format_tag_query_matches_e_hentai_search_syntax(self) -> None:
+        self.assertEqual(
+            downloader.format_tag_query("parody", "touhou project", exact=True),
+            'parody:"touhou project$"',
+        )
+        self.assertEqual(downloader.format_tag_query("language", "chinese", exact=True), "language:chinese$")
+
+    def test_search_and_typed_tags_are_combined_into_one_search(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "configs.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "configs": [
+                            {
+                                "name": "touhou-chinese",
+                                "server_conditions": [
+                                    {"type": "Search", "value": "language:chinese$"},
+                                    {
+                                        "type": "Tag",
+                                        "value": 'parody:"touhou project$"',
+                                        "prefix": "parody",
+                                        "tag_value": "touhou project",
+                                        "exact": "1",
+                                    },
+                                ],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            tasks = downloader.load_task_definitions(config_file)
+            args = tasks[0]["args"]
+
+            self.assertEqual(args[args.index("--search") + 1], 'language:chinese$ parody:"touhou project$"')
+            self.assertNotIn("--tag", args)
+
+    def test_raw_tag_condition_without_legacy_metadata_stays_in_search(self) -> None:
+        args = downloader.config_args_from_object(
+            {"server_conditions": [{"type": "Tag", "value": "title:\"comic aun\" -title:2007"}]}
+        )
+
+        self.assertEqual(args, ["--search", 'title:"comic aun" -title:2007'])
 
     def test_detail_cache_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -257,6 +528,278 @@ class DownloaderParserTests(unittest.TestCase):
             self.assertEqual([gallery.gid for gallery in loaded], [101])
             self.assertTrue((output / ".eh_batch_state" / "touhou-failures.txt").exists())
 
+    def test_archive_mode_skips_existing_valid_zip_and_records_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            target = output / "100-Archive Title.zip"
+            write_tiny_zip(target)
+            gallery = downloader.Gallery(100, "abcdef1234", "Archive Title", "https://e-hentai.org/g/100/abcdef1234/")
+            args = argparse.Namespace(output=str(output), overwrite=False, download_mode="archive-original")
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.requested_download = False
+
+                def collect_basic_detail(self, _gallery):
+                    return downloader.GalleryDetail(100, "abcdef1234", "Archive Title", 1, {}, 1)
+
+                def fetch_archive_info(self, _detail):
+                    return downloader.ArchiveInfo(
+                        url="https://e-hentai.org/archiver.php?gid=100&token=abcdef1234",
+                        original=downloader.ArchiveOption(
+                            kind="original",
+                            url="https://e-hentai.org/archiver.php?gid=100&token=abcdef1234&or=abc",
+                            dltype="org",
+                            dlcheck="Download Original Archive",
+                            cost="Free!",
+                            size="1 KiB",
+                        ),
+                    )
+
+                def request_archive_download_url(self, _archive_info, _option):
+                    self.requested_download = True
+                    return "https://ehgt.org/archive.zip"
+
+                def download_archive_file(self, *_args, **_kwargs):
+                    raise AssertionError("existing valid archive should be skipped")
+
+            client = FakeClient()
+
+            result = downloader.download_gallery_archive(client, gallery, args)
+
+            self.assertTrue(result.skipped)
+            self.assertFalse(client.requested_download)
+            metadata_path = output / ".eh_batch_state" / "archive-metadata" / "100-abcdef1234.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["archive_cost"], "Free!")
+            self.assertTrue(metadata["skipped"])
+
+    def test_archive_segmented_download_uses_range_and_validates_zip(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            target = output / "archive.zip"
+            body = make_stored_zip_bytes()
+            client = downloader.EhClient("e", "", 30, 0, 0, "direct", None)
+            opener = FakeRangeOpener(body, supports_range=True)
+            client.opener = opener
+            progress_events = []
+
+            saved, skipped = client.download_archive_file(
+                "https://ehgt.org/archive.zip",
+                "https://e-hentai.org/archiver.php",
+                target,
+                overwrite=False,
+                connections=4,
+                progress_callback=lambda done, total: progress_events.append((done, total)),
+            )
+
+            self.assertEqual(saved, target)
+            self.assertFalse(skipped)
+            self.assertTrue(downloader.validate_zip_file(target))
+            self.assertGreaterEqual(opener.range_downloads, 2)
+            self.assertEqual(opener.full_downloads, 0)
+            self.assertEqual(progress_events[-1], (len(body), len(body)))
+            self.assertEqual(client.last_archive_connections, 4)
+
+    def test_archive_segmented_download_falls_back_to_single_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = Path(temp_dir) / "archive.zip"
+            body = make_stored_zip_bytes()
+            client = downloader.EhClient("e", "", 30, 0, 0, "direct", None)
+            opener = FakeRangeOpener(body, supports_range=False)
+            client.opener = opener
+
+            saved, skipped = client.download_archive_file(
+                "https://ehgt.org/archive.zip",
+                "https://e-hentai.org/archiver.php",
+                target,
+                overwrite=False,
+                connections=4,
+            )
+
+            self.assertEqual(saved, target)
+            self.assertFalse(skipped)
+            self.assertTrue(downloader.validate_zip_file(target))
+            self.assertEqual(opener.full_downloads, 2)
+            self.assertEqual(client.last_archive_connections, 1)
+            self.assertIn("HTTP 200", client.last_archive_fallback_reason)
+            self.assertTrue(opener.responses[-1].read_sizes)
+            self.assertTrue(
+                all(size == downloader.NETWORK_READ_CHUNK_SIZE for size in opener.responses[-1].read_sizes)
+            )
+
+    def test_small_image_download_reads_entire_body_when_length_is_known(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            target_base = output / "image"
+            body = tiny_png()
+            client = downloader.EhClient("e", "", 30, 0, 0, "direct", None)
+            opener = FakeRangeOpener(body, supports_range=False)
+            client.opener = opener
+
+            saved = client.download_file(
+                "https://ehgt.org/image.png",
+                "https://e-hentai.org/s/abc/100-1",
+                target_base,
+                overwrite=False,
+            )
+
+            self.assertEqual(saved, target_base.with_suffix(".png"))
+            self.assertEqual(opener.responses[-1].read_sizes, [-1])
+
+    def test_original_resolve_404_falls_back_to_displayed_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            gallery = downloader.Gallery(100, "abcdef1234", "Original Fallback", "https://e-hentai.org/g/100/abcdef1234/")
+            args = argparse.Namespace(
+                output=str(output),
+                max_image_pages=0,
+                overwrite=False,
+                page_workers=1,
+                html_pages=True,
+                original=True,
+                delay=0.0,
+            )
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.downloaded_urls = []
+
+                def collect_detail(self, _gallery):
+                    return downloader.GalleryDetail(100, "abcdef1234", "Original Fallback", 1, {0: "ptoken"}, 1)
+
+                def detail_url(self, gid, token):
+                    return f"https://e-hentai.org/g/{gid}/{token}/"
+
+                def page_url(self, gid, index, ptoken):
+                    return f"https://e-hentai.org/s/{ptoken}/{gid}-{index + 1}"
+
+                def fetch_page_info(self, *_args, **_kwargs):
+                    return (
+                        downloader.PageInfo(
+                            image_url="https://ehgt.org/normal.png",
+                            origin_image_url="https://e-hentai.org/fullimg.php?gid=100&page=1",
+                        ),
+                        None,
+                    )
+
+                def resolve_original_url(self, info, _referer):
+                    raise downloader.HTTPError(info.origin_image_url or "", 404, "Not Found", None, None)
+
+                def download_file(self, url, _referer, target_base, overwrite):
+                    self.downloaded_urls.append(url)
+                    path = target_base.with_suffix(".png")
+                    path.write_bytes(tiny_png())
+                    return path
+
+            client = FakeClient()
+
+            downloader.download_gallery(client, gallery, args)
+
+            self.assertEqual(client.downloaded_urls, ["https://ehgt.org/normal.png"])
+
+    def test_original_download_404_falls_back_to_displayed_image(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            gallery = downloader.Gallery(100, "abcdef1234", "Original Download Fallback", "https://e-hentai.org/g/100/abcdef1234/")
+            args = argparse.Namespace(
+                output=str(output),
+                max_image_pages=0,
+                overwrite=False,
+                page_workers=1,
+                html_pages=True,
+                original=True,
+                delay=0.0,
+            )
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.downloaded_urls = []
+
+                def collect_detail(self, _gallery):
+                    return downloader.GalleryDetail(100, "abcdef1234", "Original Download Fallback", 1, {0: "ptoken"}, 1)
+
+                def detail_url(self, gid, token):
+                    return f"https://e-hentai.org/g/{gid}/{token}/"
+
+                def page_url(self, gid, index, ptoken):
+                    return f"https://e-hentai.org/s/{ptoken}/{gid}-{index + 1}"
+
+                def fetch_page_info(self, *_args, **_kwargs):
+                    return (
+                        downloader.PageInfo(
+                            image_url="https://ehgt.org/normal.png",
+                            origin_image_url="https://e-hentai.org/fullimg.php?gid=100&page=1",
+                        ),
+                        None,
+                    )
+
+                def resolve_original_url(self, _info, _referer):
+                    return "https://ehgt.org/original.png"
+
+                def download_file(self, url, _referer, target_base, overwrite):
+                    self.downloaded_urls.append(url)
+                    if url.endswith("original.png"):
+                        raise downloader.HTTPError(url, 404, "Not Found", None, None)
+                    path = target_base.with_suffix(".png")
+                    path.write_bytes(tiny_png())
+                    return path
+
+            client = FakeClient()
+
+            downloader.download_gallery(client, gallery, args)
+
+            self.assertEqual(client.downloaded_urls, ["https://ehgt.org/original.png", "https://ehgt.org/normal.png"])
+
+    def test_cached_page_token_404_refreshes_detail_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            gallery = downloader.Gallery(100, "abcdef1234", "Cached Token Refresh", "https://e-hentai.org/g/100/abcdef1234/")
+            stale = downloader.GalleryDetail(100, "abcdef1234", "Cached Token Refresh", 1, {0: "stale"}, 1)
+            downloader.save_detail_cache(output, stale)
+            args = argparse.Namespace(
+                output=str(output),
+                max_image_pages=0,
+                overwrite=False,
+                page_workers=1,
+                html_pages=True,
+                original=False,
+                delay=0.0,
+            )
+
+            class FakeClient:
+                def __init__(self) -> None:
+                    self.collect_detail_calls = 0
+                    self.page_tokens = []
+
+                def collect_detail(self, _gallery):
+                    self.collect_detail_calls += 1
+                    return downloader.GalleryDetail(100, "abcdef1234", "Cached Token Refresh", 1, {0: "fresh"}, 1)
+
+                def detail_url(self, gid, token):
+                    return f"https://e-hentai.org/g/{gid}/{token}/"
+
+                def page_url(self, gid, index, ptoken):
+                    return f"https://e-hentai.org/s/{ptoken}/{gid}-{index + 1}"
+
+                def fetch_page_info(self, gid, _token, index, ptoken, *_args, **_kwargs):
+                    self.page_tokens.append(ptoken)
+                    if ptoken == "stale":
+                        raise downloader.HTTPError(self.page_url(gid, index, ptoken), 404, "Not Found", None, None)
+                    return downloader.PageInfo(image_url="https://ehgt.org/normal.png"), None
+
+                def download_file(self, url, _referer, target_base, overwrite):
+                    path = target_base.with_suffix(".png")
+                    path.write_bytes(tiny_png())
+                    return path
+
+            client = FakeClient()
+
+            downloader.download_gallery(client, gallery, args)
+
+            self.assertEqual(client.collect_detail_calls, 1)
+            self.assertEqual(client.page_tokens, ["stale", "fresh"])
+
     def test_task_file_accepts_multiple_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             task_file = Path(temp_dir) / "tasks.json"
@@ -280,6 +823,54 @@ class DownloaderParserTests(unittest.TestCase):
 
             self.assertEqual(tasks[0]["name"], "touhou")
             self.assertEqual(tasks[0]["args"], ["--search", "touhou", "--output", "F:\\eh_downloads"])
+
+    def test_config_file_accepts_typed_configs_and_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_file = Path(temp_dir) / "configs.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "defaults": {
+                            "site": "e",
+                            "output": "F:\\eh_downloads",
+                            "download_mode": "archive-original",
+                            "archive_connections": 8,
+                            "cookie_file": "F:\\WORK\\codex\\eh_cookies.txt",
+                            "keep_going": True,
+                        },
+                        "configs": [
+                            {
+                                "name": "uploader-a",
+                                "source_type": "Uploader",
+                                "source_value": ["someone", "another"],
+                                "source_match": "any",
+                                "categories": ["doujinshi", "manga"],
+                                "title_contains": ["白杨汉化组", "中文"],
+                                "title_match": "any",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            tasks = downloader.load_task_definitions(config_file)
+
+            self.assertEqual(tasks[0]["name"], "uploader-a")
+            args = tasks[0]["args"]
+            self.assertIn("--uploader", args)
+            self.assertIn("someone", args)
+            self.assertIn("another", args)
+            self.assertIn("--archive-connections", args)
+            self.assertIn("8", args)
+            parsed = downloader.build_parser().parse_args(args)
+            self.assertEqual(parsed.download_mode, "archive-original")
+            self.assertEqual(parsed.archive_connections, 8)
+            self.assertEqual(parsed.categories, ["doujinshi", "manga"])
+            self.assertEqual(parsed.source_match, "any")
+            self.assertEqual(parsed.title_match, "any")
+            self.assertEqual(parsed.title_contains, ["白杨汉化组", "中文"])
 
 
 if __name__ == "__main__":

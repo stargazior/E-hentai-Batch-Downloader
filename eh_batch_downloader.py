@@ -21,6 +21,7 @@ import struct
 import sys
 import threading
 import time
+import zipfile
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,7 +29,7 @@ from http.client import HTTPException, IncompleteRead
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urljoin, urlparse, urlunparse
 from urllib.request import ProxyHandler, Request, build_opener
@@ -56,11 +57,21 @@ IMAGE_RE_LIST = [
     re.compile(r'<img[^>]*src=["\']([^"\']+)["\'][^>]*style', re.IGNORECASE),
 ]
 SKIP_HATH_RE = re.compile(r"""onclick=["']return\s+nl\(['"]?([^'")]+)['"]?\)""", re.IGNORECASE)
-ORIGIN_RE_LIST = [
-    re.compile(r"""<a\s+href=["']([^"']*fullimg[^"']*)["']""", re.IGNORECASE),
-    re.compile(r"""onclick=["']prompt\('Copy the URL below\.',\s*'([^']+)'""", re.IGNORECASE),
-]
+ORIGIN_RE = re.compile(r"""<a\s+href=["']([^"']*fullimg[^"']*)["']""", re.IGNORECASE)
+OTHER_IMAGE_RE = re.compile(r"""onclick=["']prompt\('Copy the URL below\.',\s*'([^']+)'""", re.IGNORECASE)
 SHOW_KEY_RE = re.compile(r'var\s+showkey\s*=\s*"([0-9a-z]+)"', re.IGNORECASE)
+ARCHIVER_FORM_RE = re.compile(r"<form\b(?P<attrs>[^>]*)>(?P<body>.*?)</form>", re.IGNORECASE | re.DOTALL)
+ARCHIVER_INPUT_RE = re.compile(r"<input\b(?P<attrs>[^>]*)>", re.IGNORECASE | re.DOTALL)
+HTML_ATTR_RE = re.compile(
+    r"""([A-Za-z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))""",
+    re.IGNORECASE,
+)
+ARCHIVER_CONTINUE_RE = re.compile(r"""document\.location\s*=\s*["']([^"']+)["']""", re.IGNORECASE)
+ARCHIVER_DOWNLOAD_LINK_RE = re.compile(
+    r"""href=["']([^"']+)["'][^>]*>\s*Click\s+Here\s+To\s+Start\s+Downloading""",
+    re.IGNORECASE | re.DOTALL,
+)
+CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)", re.IGNORECASE)
 TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
 META_CHARSET_RE = re.compile(
@@ -68,7 +79,12 @@ META_CHARSET_RE = re.compile(
     re.IGNORECASE,
 )
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.6.5"
+PROGRESS_PREFIX = "EH_PROGRESS\t"
+DEFAULT_ARCHIVE_CONNECTIONS = 8
+ARCHIVE_MIN_PART_SIZE = 1024 * 1024
+NETWORK_READ_CHUNK_SIZE = 1024 * 1024
+SMALL_FILE_BUFFER_LIMIT = 16 * 1024 * 1024
 CATEGORY_BITS = {
     "misc": 0x001,
     "doujinshi": 0x002,
@@ -145,11 +161,16 @@ BUILTIN_HOSTS = {
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 _HOSTS_INSTALLED = False
 _PRINT_LOCK = threading.Lock()
+_DEVNULL_STREAM: Optional[object] = None
 NETWORK_ERRORS = (HTTPError, URLError, TimeoutError, OSError, HTTPException)
 RECOVERABLE_ERRORS = NETWORK_ERRORS + (ValueError,)
 
 
 class DownloadIntegrityError(OSError):
+    pass
+
+
+class DownloadStageError(OSError):
     pass
 
 
@@ -166,6 +187,11 @@ class GalleryRunResult:
     gallery: Gallery
     ok: bool
     error: Optional[str] = None
+    download_mode: Optional[str] = None
+    archive_path: Optional[str] = None
+    archive_cost: Optional[str] = None
+    archive_size: Optional[str] = None
+    skipped: bool = False
 
 
 @dataclass
@@ -176,6 +202,44 @@ class GalleryDetail:
     pages: int
     page_tokens: Dict[int, str]
     preview_pages: int
+
+
+@dataclass
+class ArchiveOption:
+    kind: str
+    url: str
+    dltype: str
+    dlcheck: str
+    cost: str = ""
+    size: str = ""
+
+
+@dataclass
+class ArchiveInfo:
+    url: str
+    funds: str = ""
+    original: Optional[ArchiveOption] = None
+    resample: Optional[ArchiveOption] = None
+
+    def option(self, mode: str) -> ArchiveOption:
+        if mode == "archive-original":
+            selected = self.original
+        elif mode == "archive-resample":
+            selected = self.resample
+        else:
+            raise ValueError(f"Unsupported archive mode: {mode}")
+        if selected is None:
+            label = "original" if mode == "archive-original" else "resample"
+            raise ValueError(f"Archive {label} option is not available.")
+        return selected
+
+
+@dataclass
+class ArchiveDownloadResult:
+    path: Path
+    cost: str = ""
+    size: str = ""
+    skipped: bool = False
 
 
 @dataclass
@@ -226,6 +290,98 @@ def strip_tags(value: str) -> str:
     return normalize_space(TAG_RE.sub(" ", value))
 
 
+def parse_html_attrs(value: str) -> Dict[str, str]:
+    attrs: Dict[str, str] = {}
+    for match in HTML_ATTR_RE.finditer(value):
+        raw = match.group(2) if match.group(2) is not None else match.group(3)
+        if raw is None:
+            raw = match.group(4) or ""
+        attrs[match.group(1).lower()] = unescape(raw)
+    return attrs
+
+
+def compact_archive_text(value: str) -> str:
+    text = strip_tags(value)
+    # The archiver page has submit button labels in the middle of cost/size blocks.
+    text = re.sub(r"Download\s+(?:Original|Resample)\s+Archive", " ", text, flags=re.IGNORECASE)
+    return normalize_space(text)
+
+
+def parse_archive_context_value(context: str, label: str) -> str:
+    text = compact_archive_text(context)
+    pattern = re.compile(
+        rf"{re.escape(label)}\s*:?\s*(.+?)(?=\s+(?:Download Cost|Estimated Size|Funds?)\s*:|$)",
+        re.IGNORECASE,
+    )
+    match = pattern.search(text)
+    return normalize_space(match.group(1)) if match else ""
+
+
+def parse_archive_info(html: str, base_url: str) -> ArchiveInfo:
+    forms = list(ARCHIVER_FORM_RE.finditer(html))
+    info = ArchiveInfo(url=base_url, funds=parse_archive_context_value(html[:3000], "Funds"))
+    for index, form_match in enumerate(forms):
+        form_attrs = parse_html_attrs(form_match.group("attrs"))
+        action = form_attrs.get("action")
+        if not action:
+            continue
+
+        inputs: Dict[str, str] = {}
+        for input_match in ARCHIVER_INPUT_RE.finditer(form_match.group("body")):
+            attrs = parse_html_attrs(input_match.group("attrs"))
+            name = attrs.get("name")
+            if name:
+                inputs[name.lower()] = attrs.get("value", "")
+
+        dltype = inputs.get("dltype", "").strip()
+        dlcheck = inputs.get("dlcheck", "").strip()
+        if not dltype or not dlcheck:
+            continue
+        if dltype == "org":
+            kind = "original"
+        elif dltype == "res":
+            kind = "resample"
+        else:
+            continue
+
+        previous_end = forms[index - 1].end() if index else max(0, form_match.start() - 1500)
+        next_start = forms[index + 1].start() if index + 1 < len(forms) else min(len(html), form_match.end() + 1500)
+        cost_context = html[previous_end : form_match.start()] + form_match.group("body")
+        size_context = form_match.group("body") + html[form_match.end() : next_start]
+        option = ArchiveOption(
+            kind=kind,
+            url=urljoin(base_url, action),
+            dltype=dltype,
+            dlcheck=dlcheck,
+            cost=parse_archive_context_value(cost_context, "Download Cost"),
+            size=parse_archive_context_value(size_context, "Estimated Size"),
+        )
+        if kind == "original":
+            info.original = option
+        elif kind == "resample":
+            info.resample = option
+    return info
+
+
+def parse_archive_continue_url(html: str, base_url: str) -> Optional[str]:
+    match = ARCHIVER_CONTINUE_RE.search(html)
+    if not match:
+        return None
+    return urljoin(base_url, unescape(match.group(1)).strip())
+
+
+def parse_archive_final_download_url(html: str, base_url: str) -> Optional[str]:
+    for anchor in parse_anchors(html):
+        text = normalize_space(str(anchor.get("text") or ""))
+        href = str(anchor.get("href") or "")
+        if href and "Click Here To Start Downloading".lower() in text.lower():
+            return urljoin(base_url, href)
+    match = ARCHIVER_DOWNLOAD_LINK_RE.search(html)
+    if match:
+        return urljoin(base_url, unescape(match.group(1)).strip())
+    return None
+
+
 def sanitize_filename(value: str, default: str = "untitled") -> str:
     value = strip_tags(value)
     value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", value)
@@ -249,12 +405,13 @@ def resolve_job_name(args: argparse.Namespace) -> str:
     explicit = getattr(args, "job_name", None)
     if explicit and str(explicit).strip():
         return str(explicit).strip()
-    source_value = getattr(args, "search", None) or getattr(args, "uploader", None) or getattr(args, "tag", None)
-    if source_value:
-        return str(source_value)[:80]
-    url = getattr(args, "url", None)
-    if url:
-        match = GALLERY_RE.search(str(url))
+    for key in ("search", "uploader", "tag"):
+        values = source_values(args, key)
+        if values:
+            return ";".join(values)[:80]
+    urls = source_values(args, "url")
+    if urls:
+        match = GALLERY_RE.search(urls[0])
         if match:
             return f"gallery-{match.group('gid')}"
         return "url"
@@ -297,11 +454,36 @@ def gallery_from_dict(data: object) -> Gallery:
     )
 
 
+def successful_result_to_dict(result: GalleryRunResult) -> Dict[str, object]:
+    data = gallery_to_dict(result.gallery)
+    if result.download_mode:
+        data["download_mode"] = result.download_mode
+    if result.archive_path:
+        data["archive_path"] = result.archive_path
+    if result.archive_cost:
+        data["archive_cost"] = result.archive_cost
+    if result.archive_size:
+        data["archive_size"] = result.archive_size
+    if result.skipped:
+        data["skipped"] = result.skipped
+    return data
+
+
 def write_json_atomic(path: Path, data: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_suffix(path.suffix + ".part")
     temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     temp.replace(path)
+
+
+def cleanup_parts_dir(path: Path) -> None:
+    try:
+        for child in path.iterdir():
+            if child.is_file():
+                child.unlink()
+        path.rmdir()
+    except OSError:
+        pass
 
 
 def append_query(url: str, **items: object) -> str:
@@ -356,9 +538,82 @@ def configure_stdio() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
-def safe_print(*values: object, file: object = sys.stdout) -> None:
+def fallback_output_stream() -> object:
+    global _DEVNULL_STREAM
+    for stream in (sys.stdout, sys.__stdout__, sys.stderr, sys.__stderr__):
+        if stream is not None:
+            return stream
+    if _DEVNULL_STREAM is None:
+        _DEVNULL_STREAM = open(os.devnull, "w", encoding="utf-8")
+    return _DEVNULL_STREAM
+
+
+def safe_print(*values: object, file: Optional[object] = None) -> None:
+    stream = file if file is not None else fallback_output_stream()
     with _PRINT_LOCK:
-        print(*values, file=file, flush=True)
+        print(*values, file=stream, flush=True)
+
+
+def emit_progress(args: argparse.Namespace, **items: object) -> None:
+    if not getattr(args, "progress_json", False):
+        return
+    data = {key: value for key, value in items.items() if value is not None}
+    safe_print(PROGRESS_PREFIX + json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+
+
+def format_bytes(value: Optional[int]) -> str:
+    if value is None:
+        return "?"
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    amount = float(value)
+    for unit in units:
+        if amount < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(amount)} {unit}"
+            return f"{amount:.2f} {unit}"
+        amount /= 1024
+
+
+class ProgressThrottle:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        gid: int,
+        title: str,
+        mode: str,
+        interval: float = 0.5,
+        connections: Optional[int] = None,
+    ) -> None:
+        self.args = args
+        self.gid = gid
+        self.title = title
+        self.mode = mode
+        self.interval = interval
+        self.connections = connections
+        self.last_emit = 0.0
+
+    def __call__(self, bytes_done: int, bytes_total: Optional[int]) -> None:
+        now = time.monotonic()
+        if bytes_total is not None and bytes_done >= bytes_total:
+            should_emit = True
+        else:
+            should_emit = now - self.last_emit >= self.interval
+        if not should_emit:
+            return
+        self.last_emit = now
+        percent = None if not bytes_total else round(bytes_done * 100.0 / bytes_total, 1)
+        emit_progress(
+            self.args,
+            event="progress",
+            gid=self.gid,
+            title=self.title,
+            mode=self.mode,
+            status="Downloading",
+            percent=percent,
+            bytes_done=bytes_done,
+            bytes_total=bytes_total,
+            connections=self.connections,
+        )
 
 
 def install_builtin_hosts(enabled: bool) -> None:
@@ -415,6 +670,44 @@ def split_category_values(values: Optional[Iterable[str]]) -> List[str]:
     return result
 
 
+def split_multi_values(values: object, separators: str = r"[;\r\n]+") -> List[str]:
+    if values in (None, ""):
+        return []
+    if isinstance(values, (list, tuple)):
+        raw_values = [str(value) for value in values]
+    else:
+        raw_values = [str(values)]
+    result: List[str] = []
+    for value in raw_values:
+        for item in re.split(separators, value):
+            item = item.strip()
+            if item:
+                result.append(item)
+    return result
+
+
+def source_values(args: argparse.Namespace, key: str) -> List[str]:
+    return split_multi_values(getattr(args, key, None))
+
+
+def format_tag_query(prefix: str, value: str, exact: bool = True) -> str:
+    """Build an E-Hentai search token from a tag namespace and value."""
+    namespace = prefix.strip()
+    tag_value = value.strip()
+    if not namespace or not tag_value:
+        raise ValueError("Tag prefix and value are required.")
+    tag_value = tag_value.replace('\\', '\\\\').replace('"', '\\"')
+    if exact and not tag_value.endswith("$"):
+        tag_value += "$"
+    if any(character.isspace() for character in tag_value):
+        return f'{namespace}:"{tag_value}"'
+    return f"{namespace}:{tag_value}"
+
+
+def source_keys_with_values(args: argparse.Namespace) -> List[str]:
+    return [key for key in ("url", "search", "uploader", "tag") if source_values(args, key)]
+
+
 def included_category_mask(category_values: Optional[Iterable[str]]) -> Optional[int]:
     names = split_category_values(category_values)
     if not names:
@@ -462,6 +755,16 @@ def is_retryable_error(exc: BaseException) -> bool:
     if isinstance(exc, HTTPError):
         return exc.code in {408, 429, 500, 502, 503, 504}
     return isinstance(exc, (URLError, TimeoutError, OSError, HTTPException))
+
+
+def is_http_status(exc: BaseException, statuses: Iterable[int]) -> bool:
+    status_set = set(statuses)
+    current: Optional[BaseException] = exc
+    while current is not None:
+        if isinstance(current, HTTPError) and current.code in status_set:
+            return True
+        current = current.__cause__
+    return False
 
 
 def sleep_before_retry(attempt: int, retry_backoff: float, message: str) -> None:
@@ -601,11 +904,13 @@ def parse_page_html(html: str) -> PageInfo:
     show_key_match = SHOW_KEY_RE.search(html)
     skip_match = SKIP_HATH_RE.search(html)
     origin_url = None
-    for pattern in ORIGIN_RE_LIST:
-        match = pattern.search(html)
-        if match:
-            origin_url = unescape(match.group(1)).strip()
-            break
+    origin_match = ORIGIN_RE.search(html)
+    if origin_match:
+        origin_url = unescape(origin_match.group(1)).strip()
+    other_match = OTHER_IMAGE_RE.search(html)
+    other_image_url = unescape(other_match.group(1)).strip() if other_match else None
+    if not image_url and other_image_url:
+        image_url = other_image_url
 
     if not image_url:
         raise ValueError("Could not parse page image URL")
@@ -653,6 +958,9 @@ class EhClient:
         self.proxy_mode = proxy_mode
         self.proxy_url = proxy_url
         self.opener = build_opener(build_proxy_handler(proxy_mode, proxy_url))
+        self.last_archive_connections = 1
+        self.last_archive_fallback_reason = ""
+        self.last_archive_probe_reason = ""
 
     @classmethod
     def from_args(cls, args: argparse.Namespace, cookie_header: str) -> "EhClient":
@@ -739,12 +1047,17 @@ class EhClient:
                     expected_size = parse_content_length(response.headers.get("Content-Length"))
                     received_size = 0
                     with temp.open("wb") as handle:
-                        while True:
-                            chunk = response.read(1024 * 128)
-                            if not chunk:
-                                break
-                            handle.write(chunk)
-                            received_size += len(chunk)
+                        if expected_size is not None and expected_size <= SMALL_FILE_BUFFER_LIMIT:
+                            content = response.read()
+                            handle.write(content)
+                            received_size = len(content)
+                        else:
+                            while True:
+                                chunk = response.read(NETWORK_READ_CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                handle.write(chunk)
+                                received_size += len(chunk)
                     if expected_size is not None and received_size < expected_size:
                         raise DownloadIntegrityError(
                             f"incomplete image: got {received_size} bytes, expected {expected_size} bytes"
@@ -767,23 +1080,32 @@ class EhClient:
         raise last_error
 
     def list_url_from_args(self, args: argparse.Namespace) -> str:
-        if args.url:
-            url = args.url
-        elif args.uploader:
-            url = urljoin(self.host, "uploader/" + quote(args.uploader))
-        elif args.tag:
-            url = urljoin(self.host, "tag/" + quote(args.tag))
-        else:
-            url = self.host
+        urls = self.list_urls_from_args(args)
+        return urls[0] if urls else self.host
 
-        query = {}
-        if args.search and not (args.url or args.uploader or args.tag):
-            query["f_search"] = args.search
-
+    def list_urls_from_args(self, args: argparse.Namespace) -> List[str]:
         f_cats = resolve_f_cats(args)
-        if f_cats is not None:
-            query["f_cats"] = f_cats
-        return append_query(url, **query) if query else url
+
+        def with_categories(url: str) -> str:
+            return append_query(url, f_cats=f_cats) if f_cats is not None else url
+
+        urls = [with_categories(url) for url in source_values(args, "url")]
+
+        searches = source_values(args, "search")
+        if searches:
+            urls.extend(with_categories(append_query(self.host, f_search=value)) for value in searches)
+
+        uploaders = source_values(args, "uploader")
+        if uploaders:
+            urls.extend(
+                with_categories(urljoin(self.host, "uploader/" + quote(uploader))) for uploader in uploaders
+            )
+
+        tags = source_values(args, "tag")
+        if tags:
+            urls.extend(with_categories(urljoin(self.host, "tag/" + quote(tag))) for tag in tags)
+
+        return urls or [with_categories(self.host)]
 
     def iter_galleries(self, start_url: str, max_list_pages: int) -> Iterable[Gallery]:
         url = start_url
@@ -827,11 +1149,50 @@ class EhClient:
             detail.pages = max(detail.page_tokens.keys(), default=-1) + 1
         return detail
 
+    def collect_basic_detail(self, gallery: Gallery) -> GalleryDetail:
+        first = self.fetch_text(gallery.url, referer=self.host)
+        detail = parse_detail_html(first.body, first.final_url)
+        if gallery.title and detail.title == str(detail.gid):
+            detail.title = gallery.title
+        return detail
+
     def page_url(self, gid: int, index: int, ptoken: str) -> str:
         return urljoin(self.host, f"s/{ptoken}/{gid}-{index + 1}")
 
     def detail_url(self, gid: int, token: str) -> str:
         return urljoin(self.host, f"g/{gid}/{token}/")
+
+    def archive_url(self, gid: int, token: str) -> str:
+        return urljoin(self.host, f"archiver.php?gid={gid}&token={token}")
+
+    def fetch_archive_info(self, detail: GalleryDetail) -> ArchiveInfo:
+        archive_url = self.archive_url(detail.gid, detail.token)
+        result = self.fetch_text(archive_url, referer=self.detail_url(detail.gid, detail.token))
+        return parse_archive_info(result.body, result.final_url)
+
+    def request_archive_download_url(self, archive_info: ArchiveInfo, option: ArchiveOption) -> str:
+        payload = urlencode({"dltype": option.dltype, "dlcheck": option.dlcheck}).encode("utf-8")
+        result = self.fetch_text(
+            option.url,
+            referer=archive_info.url,
+            data=payload,
+            extra_headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": self.host.rstrip("/"),
+            },
+        )
+        continue_url = parse_archive_continue_url(result.body, result.final_url)
+        if not continue_url:
+            direct_url = parse_archive_final_download_url(result.body, result.final_url)
+            if direct_url:
+                return direct_url
+            raise ValueError("Could not parse archive continue URL.")
+
+        continue_result = self.fetch_text(continue_url, referer=option.url)
+        download_url = parse_archive_final_download_url(continue_result.body, continue_result.final_url)
+        if not download_url:
+            raise ValueError("Could not parse archive download URL.")
+        return download_url
 
     def fetch_page_info(
         self,
@@ -889,6 +1250,295 @@ class EhClient:
         assert last_error is not None
         raise last_error
 
+    def download_archive_file(
+        self,
+        url: str,
+        referer: str,
+        target: Path,
+        overwrite: bool,
+        connections: int = 1,
+        progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+        connection_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> Tuple[Path, bool]:
+        self.last_archive_connections = 1
+        self.last_archive_fallback_reason = ""
+        if target.exists() and not overwrite:
+            if validate_zip_file(target):
+                return target, True
+            target.unlink()
+
+        fell_back_to_single = False
+        if connections > 1:
+            try:
+                return self.download_archive_file_segmented(
+                    url,
+                    referer,
+                    target,
+                    connections=connections,
+                    progress_callback=progress_callback,
+                    connection_callback=connection_callback,
+                )
+            except RECOVERABLE_ERRORS as exc:
+                fell_back_to_single = True
+                self.last_archive_connections = 1
+                self.last_archive_fallback_reason = str(exc)
+                safe_print(
+                    f"archive segmented download unavailable; requested={connections}, actual=1; "
+                    f"falling back to single connection: {exc}",
+                    file=sys.stderr,
+                )
+                if connection_callback:
+                    connection_callback(1, str(exc))
+
+        if connection_callback and not fell_back_to_single:
+            connection_callback(1, "")
+        return self.download_archive_file_single(url, referer, target, progress_callback=progress_callback)
+
+    def probe_archive_range_size(self, url: str, referer: str) -> Optional[int]:
+        self.last_archive_probe_reason = ""
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.retries + 1):
+            req = Request(
+                url,
+                headers=self.make_headers(
+                    referer,
+                    {
+                        "Accept": "application/zip,application/octet-stream,*/*",
+                        "Range": "bytes=0-0",
+                    },
+                ),
+            )
+            try:
+                with self.opener.open(req, timeout=self.timeout) as response:
+                    status = getattr(response, "status", 200)
+                    if status >= 400:
+                        raise HTTPError(url, status, "archive range probe failed", response.headers, None)
+                    if status != 206:
+                        self.last_archive_probe_reason = (
+                            f"range probe returned HTTP {status}; "
+                            f"Accept-Ranges={response.headers.get('Accept-Ranges', '?')}; "
+                            f"Content-Range={response.headers.get('Content-Range', '?')}"
+                        )
+                        return None
+                    total = parse_content_range_total(response.headers.get("Content-Range"))
+                    response.read(1)
+                    if not total:
+                        self.last_archive_probe_reason = (
+                            "range probe returned 206 without a valid Content-Range "
+                            f"({response.headers.get('Content-Range', '?')})"
+                        )
+                    return total
+            except NETWORK_ERRORS as exc:
+                last_error = exc
+                if attempt >= self.retries or not is_retryable_error(exc):
+                    raise
+                sleep_before_retry(attempt, self.retry_backoff, f"archive range probe failed: {url}: {exc}")
+        assert last_error is not None
+        raise last_error
+
+    def download_archive_file_segmented(
+        self,
+        url: str,
+        referer: str,
+        target: Path,
+        connections: int,
+        progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+        connection_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> Tuple[Path, bool]:
+        total_size = self.probe_archive_range_size(url, referer)
+        if not total_size:
+            raise DownloadIntegrityError(self.last_archive_probe_reason or "server did not advertise HTTP Range support")
+
+        ranges = split_ranges(total_size, connections)
+        if len(ranges) <= 1:
+            raise DownloadIntegrityError("archive is too small for segmented download")
+        self.last_archive_connections = len(ranges)
+        if connection_callback:
+            connection_callback(len(ranges), "")
+
+        target.parent.mkdir(parents=True, exist_ok=True)
+        parts_dir = target.parent / f"{target.name}.parts"
+        parts_dir.mkdir(parents=True, exist_ok=True)
+        parts = [parts_dir / f"{index:04d}.part" for index in range(len(ranges))]
+        temp = target.with_suffix(target.suffix + ".part")
+        progress_lock = threading.Lock()
+        part_progress = [0 for _part in ranges]
+
+        def set_part_progress(index: int, value: int) -> None:
+            with progress_lock:
+                part_progress[index] = max(0, value)
+                current = sum(part_progress)
+            if progress_callback:
+                progress_callback(current, total_size)
+
+        def download_part(index: int, start: int, end: int, part_path: Path) -> None:
+            expected_size = end - start + 1
+            if part_path.exists() and part_path.stat().st_size == expected_size:
+                return
+            if part_path.exists():
+                part_path.unlink()
+            part_temp = part_path.with_suffix(part_path.suffix + ".tmp")
+            last_error: Optional[BaseException] = None
+            for attempt in range(self.retries + 1):
+                req = Request(
+                    url,
+                    headers=self.make_headers(
+                        referer,
+                        {
+                            "Accept": "application/zip,application/octet-stream,*/*",
+                            "Range": f"bytes={start}-{end}",
+                        },
+                    ),
+                )
+                try:
+                    with self.opener.open(req, timeout=self.timeout) as response:
+                        status = getattr(response, "status", 200)
+                        if status >= 400:
+                            raise HTTPError(url, status, "archive part download failed", response.headers, None)
+                        if status != 206:
+                            raise DownloadIntegrityError("server did not honor HTTP Range request")
+                        received_part = 0
+                        with part_temp.open("wb") as handle:
+                            while True:
+                                chunk = response.read(NETWORK_READ_CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                handle.write(chunk)
+                                received_part += len(chunk)
+                                set_part_progress(index, received_part)
+                        if received_part != expected_size:
+                            raise DownloadIntegrityError(
+                                f"incomplete archive part {index + 1}: got {received_part} bytes, "
+                                f"expected {expected_size} bytes"
+                            )
+                        part_temp.replace(part_path)
+                        set_part_progress(index, expected_size)
+                        return
+                except NETWORK_ERRORS as exc:
+                    last_error = exc
+                    set_part_progress(index, 0)
+                    if part_temp.exists():
+                        try:
+                            part_temp.unlink()
+                        except OSError:
+                            pass
+                    if attempt >= self.retries or not is_retryable_error(exc):
+                        raise
+                    sleep_before_retry(
+                        attempt,
+                        self.retry_backoff,
+                        f"archive part {index + 1}/{len(ranges)} failed: {url}: {exc}",
+                    )
+            assert last_error is not None
+            raise last_error
+
+        pending = []
+        for index, (start, end) in enumerate(ranges):
+            part_path = parts[index]
+            expected_size = end - start + 1
+            if part_path.exists() and part_path.stat().st_size == expected_size:
+                part_progress[index] = expected_size
+            else:
+                pending.append((index, start, end, part_path))
+        if progress_callback:
+            progress_callback(sum(part_progress), total_size)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(ranges)) as executor:
+            futures = [executor.submit(download_part, *item) for item in pending]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+        try:
+            with temp.open("wb") as output:
+                for part_path in parts:
+                    with part_path.open("rb") as part:
+                        while True:
+                            chunk = part.read(NETWORK_READ_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            output.write(chunk)
+            if temp.stat().st_size != total_size:
+                raise DownloadIntegrityError(
+                    f"incomplete archive after merge: got {temp.stat().st_size} bytes, expected {total_size} bytes"
+                )
+            if not validate_zip_file(temp):
+                raise DownloadIntegrityError(f"incomplete or invalid archive file: {temp}")
+            temp.replace(target)
+            cleanup_parts_dir(parts_dir)
+            if progress_callback:
+                progress_callback(total_size, total_size)
+            return target, False
+        except OSError:
+            if temp.exists():
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+            raise
+
+    def download_archive_file_single(
+        self,
+        url: str,
+        referer: str,
+        target: Path,
+        progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+    ) -> Tuple[Path, bool]:
+        if target.exists():
+            target.unlink()
+
+        last_error: Optional[BaseException] = None
+        for attempt in range(self.retries + 1):
+            req = Request(
+                url,
+                headers=self.make_headers(
+                    referer,
+                    {"Accept": "application/zip,application/octet-stream,*/*"},
+                ),
+            )
+            temp: Optional[Path] = None
+            try:
+                with self.opener.open(req, timeout=self.timeout) as response:
+                    status = getattr(response, "status", 200)
+                    if status >= 400:
+                        raise HTTPError(url, status, "archive download failed", response.headers, None)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    temp = target.with_suffix(target.suffix + ".part")
+                    expected_size = parse_content_length(response.headers.get("Content-Length"))
+                    received_size = 0
+                    if progress_callback:
+                        progress_callback(0, expected_size)
+                    with temp.open("wb") as handle:
+                        while True:
+                            chunk = response.read(NETWORK_READ_CHUNK_SIZE)
+                            if not chunk:
+                                break
+                            handle.write(chunk)
+                            received_size += len(chunk)
+                            if progress_callback:
+                                progress_callback(received_size, expected_size)
+                    if expected_size is not None and received_size < expected_size:
+                        raise DownloadIntegrityError(
+                            f"incomplete archive: got {received_size} bytes, expected {expected_size} bytes"
+                        )
+                    if not validate_zip_file(temp):
+                        raise DownloadIntegrityError(f"incomplete or invalid archive file: {temp}")
+                    temp.replace(target)
+                    if progress_callback:
+                        progress_callback(received_size, expected_size)
+                    return target, False
+            except NETWORK_ERRORS as exc:
+                last_error = exc
+                if temp and temp.exists():
+                    try:
+                        temp.unlink()
+                    except OSError:
+                        pass
+                if attempt >= self.retries or not is_retryable_error(exc):
+                    raise
+                sleep_before_retry(attempt, self.retry_backoff, f"archive request failed: {url}: {exc}")
+        assert last_error is not None
+        raise last_error
+
 
 def choose_extension(content_type: Optional[str], url: str) -> str:
     if content_type:
@@ -914,6 +1564,33 @@ def parse_content_length(value: Optional[str]) -> Optional[int]:
     return parsed if parsed >= 0 else None
 
 
+def parse_content_range_total(value: Optional[str]) -> Optional[int]:
+    if not value:
+        return None
+    match = CONTENT_RANGE_RE.search(value)
+    if not match:
+        return None
+    total = match.group(3)
+    return int(total) if total.isdigit() else None
+
+
+def split_ranges(total_size: int, connections: int, min_part_size: int = ARCHIVE_MIN_PART_SIZE) -> List[Tuple[int, int]]:
+    if total_size <= 0:
+        return []
+    max_parts = max(1, (total_size + min_part_size - 1) // min_part_size)
+    parts = max(1, min(connections, max_parts))
+    ranges: List[Tuple[int, int]] = []
+    base_size = total_size // parts
+    remainder = total_size % parts
+    start = 0
+    for index in range(parts):
+        size = base_size + (1 if index < remainder else 0)
+        end = start + size - 1
+        ranges.append((start, end))
+        start = end + 1
+    return ranges
+
+
 def validate_image_file(path: Path) -> bool:
     try:
         with path.open("rb") as handle:
@@ -929,6 +1606,18 @@ def validate_image_file(path: Path) -> bool:
                 return validate_webp_file(path, header)
             return False
     except OSError:
+        return False
+
+
+def validate_zip_file(path: Path) -> bool:
+    try:
+        if path.stat().st_size <= 0:
+            return False
+        with zipfile.ZipFile(path) as archive:
+            if not archive.infolist():
+                return False
+            return archive.testzip() is None
+    except (OSError, RuntimeError, zipfile.BadZipFile):
         return False
 
 
@@ -1051,35 +1740,219 @@ def image_exists(target_base: Path, cleanup_invalid: bool = False) -> bool:
     return find_existing_image(target_base, cleanup_invalid) is not None
 
 
+def archive_metadata_path(output: Path, gid: int, token: str) -> Path:
+    return state_dir_for(output) / "archive-metadata" / f"{gid}-{sanitize_filename(token, 'token')}.json"
+
+
+def write_archive_metadata(
+    output: Path,
+    detail: GalleryDetail,
+    mode: str,
+    option: ArchiveOption,
+    path: Path,
+    download_url: Optional[str],
+    skipped: bool,
+) -> None:
+    data = {
+        "version": 1,
+        "download_mode": mode,
+        "gid": detail.gid,
+        "token": detail.token,
+        "title": detail.title,
+        "archive_path": str(path),
+        "archive_cost": option.cost,
+        "archive_size": option.size,
+        "archive_option": option.kind,
+        "archive_form_url": option.url,
+        "download_url": download_url,
+        "skipped": skipped,
+        "updated_at": current_time_text(),
+    }
+    write_json_atomic(archive_metadata_path(output, detail.gid, detail.token), data)
+
+
 def matches_gallery(gallery: Gallery, args: argparse.Namespace) -> bool:
     title = gallery.title or ""
-    if args.title_contains and args.title_contains.lower() not in title.lower():
-        return False
-    if args.title_regex and not re.search(args.title_regex, title, re.IGNORECASE):
-        return False
-    return True
+    title_match = getattr(args, "title_match", "all")
+    checks: List[bool] = []
+    contains_values = split_multi_values(getattr(args, "title_contains", None))
+    checks.extend(value.lower() in title.lower() for value in contains_values)
+    regex_values = split_multi_values(getattr(args, "title_regex", None))
+    checks.extend(re.search(pattern, title, re.IGNORECASE) is not None for pattern in regex_values)
+    if not checks:
+        return True
+    return any(checks) if title_match == "any" else all(checks)
+
+
+def download_gallery_archive(client: EhClient, gallery: Gallery, args: argparse.Namespace) -> ArchiveDownloadResult:
+    output = Path(args.output)
+    mode = getattr(args, "download_mode", "archive-original")
+    emit_progress(
+        args,
+        event="gallery",
+        gid=gallery.gid,
+        title=gallery.title,
+        mode=mode,
+        status="Preparing",
+        percent=0,
+    )
+    try:
+        detail = client.collect_basic_detail(gallery)
+    except RECOVERABLE_ERRORS as exc:
+        raise DownloadStageError(f"gallery detail: {gallery.url}: {exc}") from exc
+
+    basename = sanitize_filename(f"{detail.gid}-{detail.title}", str(detail.gid))
+    archive_suffix = ".zip" if mode == "archive-original" else ".resample.zip"
+    target = output / f"{basename}{archive_suffix}"
+    emit_progress(
+        args,
+        event="gallery",
+        gid=detail.gid,
+        title=detail.title,
+        mode=mode,
+        status="Checking",
+        percent=0,
+    )
+
+    if target.exists() and not args.overwrite and validate_zip_file(target):
+        kind = "original" if mode == "archive-original" else "resample"
+        try:
+            archive_info = client.fetch_archive_info(detail)
+            option = archive_info.option(mode)
+        except RECOVERABLE_ERRORS as exc:
+            option = ArchiveOption(kind=kind, url="", dltype="", dlcheck="")
+            safe_print(f"[{detail.gid}] archive metadata unavailable while skipping existing file: {exc}", file=sys.stderr)
+        safe_print(
+            f"[{detail.gid}] archive {option.kind} exists, skipped "
+            f"(cost={option.cost or '?'}, size={option.size or '?'}) -> {target}"
+        )
+        write_archive_metadata(output, detail, mode, option, target, None, skipped=True)
+        emit_progress(
+            args,
+            event="gallery",
+            gid=detail.gid,
+            title=detail.title,
+            mode=mode,
+            status="Skipped",
+            percent=100,
+            size=option.size,
+            cost=option.cost,
+            path=str(target),
+        )
+        return ArchiveDownloadResult(path=target, cost=option.cost, size=option.size, skipped=True)
+
+    try:
+        emit_progress(args, event="gallery", gid=detail.gid, title=detail.title, mode=mode, status="Archiver")
+        archive_info = client.fetch_archive_info(detail)
+        option = archive_info.option(mode)
+        connections = max(1, int(getattr(args, "archive_connections", 1)))
+        safe_print(
+            f"[{detail.gid}] archive {option.kind} cost={option.cost or '?'} "
+            f"size={option.size or '?'} requested_connections={connections}"
+        )
+        emit_progress(
+            args,
+            event="gallery",
+            gid=detail.gid,
+            title=detail.title,
+            mode=mode,
+            status="Requesting",
+            percent=0,
+            size=option.size,
+            cost=option.cost,
+            connections=connections,
+        )
+        download_url = client.request_archive_download_url(archive_info, option)
+        progress = ProgressThrottle(args, detail.gid, detail.title, mode, connections=connections)
+
+        def on_archive_connections(actual: int, reason: str = "") -> None:
+            progress.connections = actual
+            if reason:
+                safe_print(f"[{detail.gid}] archive connection fallback: {reason}", file=sys.stderr)
+            emit_progress(
+                args,
+                event="gallery",
+                gid=detail.gid,
+                title=detail.title,
+                mode=mode,
+                status="Downloading",
+                percent=0,
+                size=option.size,
+                cost=option.cost,
+                connections=actual,
+            )
+
+        saved, skipped = client.download_archive_file(
+            download_url,
+            referer=archive_info.url,
+            target=target,
+            overwrite=args.overwrite,
+            connections=connections,
+            progress_callback=progress,
+            connection_callback=on_archive_connections,
+        )
+    except RECOVERABLE_ERRORS as exc:
+        raise DownloadStageError(f"archive download: {gallery.url}: {exc}") from exc
+
+    write_archive_metadata(output, detail, mode, option, saved, download_url, skipped=skipped)
+    if skipped:
+        safe_print(f"[{detail.gid}] archive exists, skipped -> {saved}")
+    else:
+        safe_print(f"[{detail.gid}] archive saved -> {saved}")
+    emit_progress(
+        args,
+        event="gallery",
+        gid=detail.gid,
+        title=detail.title,
+        mode=mode,
+        status="Skipped" if skipped else "Done",
+        percent=100,
+        size=option.size,
+        cost=option.cost,
+        connections=client.last_archive_connections,
+        path=str(saved),
+    )
+    return ArchiveDownloadResult(path=saved, cost=option.cost, size=option.size, skipped=skipped)
 
 
 def download_gallery(client: EhClient, gallery: Gallery, args: argparse.Namespace) -> None:
     output = Path(args.output)
-    detail = load_detail_cache(output, gallery)
-    if detail is None:
-        detail = client.collect_detail(gallery)
+    emit_progress(
+        args,
+        event="gallery",
+        gid=gallery.gid,
+        title=gallery.title,
+        mode=getattr(args, "download_mode", "pages"),
+        status="Preparing",
+        percent=0,
+    )
+    cached_detail = load_detail_cache(output, gallery)
+    detail_from_cache = cached_detail is not None
+    if cached_detail is None:
+        try:
+            detail = client.collect_detail(gallery)
+        except RECOVERABLE_ERRORS as exc:
+            raise DownloadStageError(f"gallery detail: {gallery.url}: {exc}") from exc
         save_detail_cache(output, detail)
+    else:
+        detail = cached_detail
 
     dirname = sanitize_filename(f"{detail.gid}-{detail.title}", str(detail.gid))
     gallery_dir = output / dirname
     gallery_dir.mkdir(parents=True, exist_ok=True)
 
-    metadata = {
-        "gid": detail.gid,
-        "token": detail.token,
-        "title": detail.title,
-        "url": client.detail_url(detail.gid, detail.token),
-        "pages": detail.pages,
-        "page_tokens": {str(index): token for index, token in sorted(detail.page_tokens.items())},
-    }
-    (gallery_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    def write_metadata(current_detail: GalleryDetail) -> None:
+        metadata = {
+            "gid": current_detail.gid,
+            "token": current_detail.token,
+            "title": current_detail.title,
+            "url": client.detail_url(current_detail.gid, current_detail.token),
+            "pages": current_detail.pages,
+            "page_tokens": {str(index): token for index, token in sorted(current_detail.page_tokens.items())},
+        }
+        (gallery_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    write_metadata(detail)
 
     downloaded = 0
     max_pages = min(detail.pages, args.max_image_pages) if args.max_image_pages else detail.pages
@@ -1093,30 +1966,134 @@ def download_gallery(client: EhClient, gallery: Gallery, args: argparse.Namespac
         if not args.overwrite and image_exists(target_base, cleanup_invalid=True):
             continue
         pending_indices.append(index)
+    already_done = max_pages - len(pending_indices)
 
-    def download_one(page_client: EhClient, index: int, show_key_hint: Optional[str]) -> Optional[str]:
-        ptoken = detail.page_tokens.get(index)
+    def emit_page_progress(status: str, done_pages: int, error: Optional[str] = None) -> None:
+        percent = round(done_pages * 100.0 / max_pages, 1) if max_pages else 100
+        emit_progress(
+            args,
+            event="gallery",
+            gid=detail.gid,
+            title=detail.title,
+            mode=getattr(args, "download_mode", "pages"),
+            status=status,
+            percent=percent,
+            done=done_pages,
+            total=max_pages,
+            error=error,
+        )
+
+    emit_page_progress("Checking" if already_done else "Downloading", already_done)
+
+    detail_lock = threading.Lock()
+    detail_refreshed = False
+
+    def current_detail() -> GalleryDetail:
+        with detail_lock:
+            return detail
+
+    def refresh_detail_after_page_404(page_client: EhClient, index: int, exc: BaseException) -> bool:
+        nonlocal detail, detail_refreshed
+        if not detail_from_cache or not is_http_status(exc, {404}):
+            return False
+        with detail_lock:
+            if detail_refreshed:
+                return True
+            safe_print(
+                f"[{detail.gid}] {index + 1}/{max_pages} page token returned 404; refreshing gallery detail cache",
+                file=sys.stderr,
+            )
+            try:
+                refreshed = page_client.collect_detail(gallery)
+            except RECOVERABLE_ERRORS as refresh_exc:
+                safe_print(
+                    f"[{detail.gid}] {index + 1}/{max_pages} detail refresh failed: {refresh_exc}",
+                    file=sys.stderr,
+                )
+                return False
+            detail = refreshed
+            detail_refreshed = True
+            save_detail_cache(output, detail)
+            write_metadata(detail)
+            return True
+
+    def fetch_page_info_for_index(
+        page_client: EhClient,
+        index: int,
+        show_key_hint: Optional[str],
+    ) -> Tuple[PageInfo, Optional[str], GalleryDetail, str]:
+        current = current_detail()
+        ptoken = current.page_tokens.get(index)
         if not ptoken:
             raise ValueError(f"Missing page token for page {index + 1}")
-        previous_ptoken = detail.page_tokens.get(index - 1) if index > 0 else None
+        previous_ptoken = current.page_tokens.get(index - 1) if index > 0 else None
+        page_url = page_client.page_url(current.gid, index, ptoken)
+        try:
+            info, next_show_key = page_client.fetch_page_info(
+                current.gid,
+                current.token,
+                index,
+                ptoken,
+                previous_ptoken,
+                show_key_hint,
+                prefer_api=not args.html_pages,
+            )
+        except RECOVERABLE_ERRORS as exc:
+            if refresh_detail_after_page_404(page_client, index, exc):
+                current = current_detail()
+                ptoken = current.page_tokens.get(index)
+                if not ptoken:
+                    raise DownloadStageError(f"page info {index + 1}: missing page token after refresh") from exc
+                previous_ptoken = current.page_tokens.get(index - 1) if index > 0 else None
+                page_url = page_client.page_url(current.gid, index, ptoken)
+                try:
+                    info, next_show_key = page_client.fetch_page_info(
+                        current.gid,
+                        current.token,
+                        index,
+                        ptoken,
+                        previous_ptoken,
+                        show_key_hint,
+                        prefer_api=not args.html_pages,
+                    )
+                except RECOVERABLE_ERRORS as retry_exc:
+                    raise DownloadStageError(f"page info {index + 1}: {page_url}: {retry_exc}") from retry_exc
+            else:
+                raise DownloadStageError(f"page info {index + 1}: {page_url}: {exc}") from exc
+        return info, next_show_key, current, page_url
+
+    def download_one(page_client: EhClient, index: int, show_key_hint: Optional[str]) -> Optional[str]:
         target_base = gallery_dir / f"{index + 1:08d}"
         if not args.overwrite and image_exists(target_base, cleanup_invalid=True):
             return show_key_hint
-        info, next_show_key = page_client.fetch_page_info(
-            detail.gid,
-            detail.token,
-            index,
-            ptoken,
-            previous_ptoken,
-            show_key_hint,
-            prefer_api=not args.html_pages,
-        )
-        referer = page_client.page_url(detail.gid, index, ptoken)
+        info, next_show_key, page_detail, referer = fetch_page_info_for_index(page_client, index, show_key_hint)
         image_url = info.image_url
-        if args.original:
-            image_url = page_client.resolve_original_url(info, referer) or info.image_url
-        saved = page_client.download_file(image_url, referer, target_base, overwrite=args.overwrite)
-        safe_print(f"[{detail.gid}] {index + 1}/{max_pages} -> {saved}")
+        saved: Optional[Path] = None
+        if args.original and info.origin_image_url:
+            try:
+                original_url = page_client.resolve_original_url(info, referer)
+            except RECOVERABLE_ERRORS as exc:
+                safe_print(
+                    f"[{page_detail.gid}] {index + 1}/{max_pages} original unavailable; "
+                    f"falling back to displayed image: {exc}",
+                    file=sys.stderr,
+                )
+            else:
+                if original_url:
+                    try:
+                        saved = page_client.download_file(original_url, referer, target_base, overwrite=args.overwrite)
+                    except RECOVERABLE_ERRORS as exc:
+                        safe_print(
+                            f"[{page_detail.gid}] {index + 1}/{max_pages} original download failed; "
+                            f"falling back to displayed image: {exc}",
+                            file=sys.stderr,
+                        )
+        if saved is None:
+            try:
+                saved = page_client.download_file(image_url, referer, target_base, overwrite=args.overwrite)
+            except RECOVERABLE_ERRORS as exc:
+                raise DownloadStageError(f"image download {index + 1}: {image_url}: {exc}") from exc
+        safe_print(f"[{page_detail.gid}] {index + 1}/{max_pages} -> {saved}")
         if args.delay > 0:
             time.sleep(args.delay)
         return next_show_key
@@ -1127,11 +2104,13 @@ def download_gallery(client: EhClient, gallery: Gallery, args: argparse.Namespac
         for index in pending_indices:
             show_key = download_one(client, index, show_key)
             downloaded += 1
+            emit_page_progress("Downloading", already_done + downloaded)
     else:
         if pending_indices and not args.html_pages:
             first_index = pending_indices.pop(0)
             show_key = download_one(client, first_index, None)
             downloaded += 1
+            emit_page_progress("Downloading", already_done + downloaded)
 
         worker_state = threading.local()
 
@@ -1150,8 +2129,10 @@ def download_gallery(client: EhClient, gallery: Gallery, args: argparse.Namespac
             for future in concurrent.futures.as_completed(future_map):
                 future.result()
                 downloaded += 1
+                emit_page_progress("Downloading", already_done + downloaded)
 
     safe_print(f"[{detail.gid}] done, downloaded {downloaded} file(s)")
+    emit_page_progress("Done", max_pages)
 
 
 def print_batch_summary(total: int, successes: int, failed_gids: List[int]) -> None:
@@ -1169,9 +2150,9 @@ def source_description(args: argparse.Namespace) -> str:
     if getattr(args, "retry_failed", False):
         return f"retry-failed:{resolve_job_name(args)}"
     for key in ("search", "uploader", "tag", "url"):
-        value = getattr(args, key, None)
-        if value:
-            return f"{key}:{value}"
+        values = source_values(args, key)
+        if values:
+            return f"{key}:{';'.join(values)}"
     return "unknown"
 
 
@@ -1201,7 +2182,7 @@ def write_run_state(
             }
             for result in failed_results
         ],
-        "successful_galleries": [gallery_to_dict(result.gallery) for result in success_results],
+        "successful_galleries": [successful_result_to_dict(result) for result in success_results],
     }
     write_json_atomic(latest_state_path(output, job_name), state)
 
@@ -1273,15 +2254,44 @@ def run(args: argparse.Namespace) -> int:
         galleries = load_failed_galleries(output, job_name)
         safe_print(f"[batch] retrying {len(galleries)} failed gallery/galleries for job '{job_name}'")
     else:
-        start_url = client.list_url_from_args(args)
-        galleries = [
-            gallery for gallery in client.iter_galleries(start_url, args.max_list_pages) if matches_gallery(gallery, args)
-        ]
+        galleries = []
+        source_urls = client.list_urls_from_args(args)
+        source_match = getattr(args, "source_match", "any")
+        if source_match == "all" and len(source_urls) > 1:
+            source_results: List[Dict[int, Gallery]] = []
+            for start_url in source_urls:
+                current: Dict[int, Gallery] = {}
+                for gallery in client.iter_galleries(start_url, args.max_list_pages):
+                    current.setdefault(gallery.gid, gallery)
+                source_results.append(current)
+            common_gids = set(source_results[0])
+            for current in source_results[1:]:
+                common_gids.intersection_update(current)
+            candidates = [gallery for gid, gallery in source_results[0].items() if gid in common_gids]
+        else:
+            candidates = []
+            seen_gids = set()
+            for start_url in source_urls:
+                for gallery in client.iter_galleries(start_url, args.max_list_pages):
+                    if gallery.gid in seen_gids:
+                        continue
+                    seen_gids.add(gallery.gid)
+                    candidates.append(gallery)
+        galleries = [gallery for gallery in candidates if matches_gallery(gallery, args)]
     if args.max_galleries:
         galleries = galleries[: args.max_galleries]
 
     if args.dry_run:
         for gallery in galleries:
+            emit_progress(
+                args,
+                event="gallery",
+                gid=gallery.gid,
+                title=gallery.title,
+                mode=getattr(args, "download_mode", "pages"),
+                status="Waiting",
+                percent=0,
+            )
             safe_print(f"{gallery.gid}\t{gallery.title}\t{gallery.url}")
         safe_print(f"{len(galleries)} gallery/galleries matched")
         return 0
@@ -1296,12 +2306,33 @@ def run(args: argparse.Namespace) -> int:
     def run_one(gallery: Gallery) -> GalleryRunResult:
         worker_client = EhClient.from_args(args, cookie_header)
         safe_print(f"[{gallery.gid}] start {gallery.title}")
+        mode = getattr(args, "download_mode", "pages")
         try:
+            if mode in {"archive-original", "archive-resample"}:
+                archive_result = download_gallery_archive(worker_client, gallery, args)
+                return GalleryRunResult(
+                    gallery=gallery,
+                    ok=True,
+                    download_mode=mode,
+                    archive_path=str(archive_result.path),
+                    archive_cost=archive_result.cost,
+                    archive_size=archive_result.size,
+                    skipped=archive_result.skipped,
+                )
             download_gallery(worker_client, gallery, args)
-            return GalleryRunResult(gallery=gallery, ok=True)
+            return GalleryRunResult(gallery=gallery, ok=True, download_mode=mode)
         except RECOVERABLE_ERRORS as exc:
             safe_print(f"[{gallery.gid}] failed: {exc}", file=sys.stderr)
-            return GalleryRunResult(gallery=gallery, ok=False, error=str(exc))
+            emit_progress(
+                args,
+                event="gallery",
+                gid=gallery.gid,
+                title=gallery.title,
+                mode=mode,
+                status="Error",
+                error=str(exc),
+            )
+            return GalleryRunResult(gallery=gallery, ok=False, error=str(exc), download_mode=mode)
 
     workers = max(1, min(args.gallery_workers, len(galleries)))
     results: List[GalleryRunResult] = []
@@ -1385,6 +2416,40 @@ def self_test() -> int:
     api_json = json.dumps({"i3": '<img id="img" src="https://ehgt.org/full/002.png" style="">', "i6": "", "i7": None})
     assert parse_page_api_json(api_json).image_url.endswith("002.png")
 
+    archive_html = """
+    <div>Funds: 9,999 GP</div>
+    <p>Download Cost: <strong>Free!</strong></p>
+    <form action="/archiver.php?gid=100&amp;token=abcdef1234&amp;or=abc" method="post">
+      <input type="hidden" name="dltype" value="org">
+      <input type="submit" name="dlcheck" value="Download Original Archive">
+    </form>
+    <p>Estimated Size: <strong>18.46 MiB</strong></p>
+    <p>Download Cost: <strong>20 GP</strong></p>
+    <form action="/archiver.php?gid=100&amp;token=abcdef1234&amp;or=def" method="post">
+      <input type="hidden" name="dltype" value="res">
+      <input type="submit" name="dlcheck" value="Download Resample Archive">
+    </form>
+    <p>Estimated Size: <strong>8.00 MiB</strong></p>
+    """
+    archive_info = parse_archive_info(archive_html, "https://e-hentai.org/archiver.php?gid=100&token=abcdef1234")
+    assert archive_info.original is not None and archive_info.original.cost == "Free!"
+    assert archive_info.original.size == "18.46 MiB"
+    assert archive_info.resample is not None and archive_info.resample.cost == "20 GP"
+    assert archive_info.resample.size == "8.00 MiB"
+    assert (
+        parse_archive_continue_url('document.location = "/archiver.php?gid=100&next=1";', "https://e-hentai.org/")
+        == "https://e-hentai.org/archiver.php?gid=100&next=1"
+    )
+    assert (
+        parse_archive_final_download_url(
+            '<a href="/archive.zip">Click Here To Start Downloading</a>',
+            "https://e-hentai.org/archiver.php",
+        )
+        == "https://e-hentai.org/archive.zip"
+    )
+    assert parse_content_range_total("bytes 0-0/12345") == 12345
+    assert split_ranges(10, 3, min_part_size=1) == [(0, 3), (4, 6), (7, 9)]
+
     gb18030_html = '<a href="https://e-hentai.org/g/102/cdefab3456/">[中文翻译] [白杨汉化组]</a>'.encode("gb18030")
     decoded = decode_response_body(gb18030_html, {})
     assert "[中文翻译]" in decoded
@@ -1399,11 +2464,17 @@ def self_test() -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Batch download galleries from E-Hentai/ExHentai.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
-    source = parser.add_mutually_exclusive_group()
-    source.add_argument("--url", help="Existing gallery list/search URL.")
-    source.add_argument("--search", help="Search keywords.")
-    source.add_argument("--uploader", help="Download from an uploader listing.")
-    source.add_argument("--tag", help="Download from a tag listing.")
+    source = parser
+    source.add_argument("--url", action="append", help="Existing gallery list/search URL. Repeat or separate with semicolons for OR.")
+    source.add_argument("--search", action="append", help="Search keywords. Repeat or separate with semicolons for OR/AND.")
+    source.add_argument("--uploader", action="append", help="Download from uploader listing(s). Repeat or separate with semicolons.")
+    source.add_argument("--tag", action="append", help="Download from tag listing(s). Repeat or separate with semicolons.")
+    parser.add_argument(
+        "--source-match",
+        choices=["any", "all"],
+        default="any",
+        help="How multiple source values are combined. any=OR, all=AND where meaningful.",
+    )
     parser.add_argument("--site", choices=["e", "ex"], default="e", help="Target site. Default: e.")
     parser.add_argument(
         "--category",
@@ -1413,8 +2484,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Included gallery category name(s), repeatable or comma-separated. Example: doujinshi,manga,non-h.",
     )
     parser.add_argument("--f-cats", type=int, help="Raw f_cats value for search/list pages.")
-    parser.add_argument("--title-contains", help="Only keep galleries whose title contains this text.")
-    parser.add_argument("--title-regex", help="Only keep galleries whose title matches this regex.")
+    parser.add_argument("--title-contains", action="append", help="Only keep galleries whose title contains this text. Repeat or use semicolons.")
+    parser.add_argument("--title-regex", action="append", help="Only keep galleries whose title matches this regex. Repeat or use semicolons.")
+    parser.add_argument(
+        "--title-match",
+        choices=["any", "all"],
+        default="all",
+        help="How multiple title filters are combined. any=OR, all=AND.",
+    )
     parser.add_argument("--max-list-pages", type=int, default=1, help="Maximum listing pages to scan.")
     parser.add_argument("--max-galleries", type=int, default=0, help="Maximum galleries to download. 0 means no cap.")
     parser.add_argument("--max-image-pages", type=int, default=0, help="Maximum image pages per gallery. 0 means all.")
@@ -1425,6 +2502,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--delay", type=float, default=0.0, help="Delay between image downloads.")
     parser.add_argument("--retries", type=int, default=3, help="Retry count for failed HTTP requests.")
     parser.add_argument("--retry-backoff", type=float, default=2.0, help="Initial retry backoff in seconds.")
+    parser.add_argument(
+        "--download-mode",
+        choices=["pages", "archive-original", "archive-resample"],
+        default="pages",
+        help="Download mode. pages saves individual images; archive-original/resample saves zip archives.",
+    )
+    parser.add_argument(
+        "--archive-connections",
+        type=int,
+        default=DEFAULT_ARCHIVE_CONNECTIONS,
+        help="Concurrent HTTP Range connections for archive zip downloads. Falls back to single connection if unsupported.",
+    )
     parser.add_argument(
         "--gallery-workers",
         type=int,
@@ -1458,12 +2547,158 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--job-name", help="Persistent job name for state and retry files.")
     parser.add_argument("--retry-failed", action="store_true", help="Retry failed galleries from the latest job state.")
     parser.add_argument("--list-failures", action="store_true", help="List latest recorded failures and exit.")
-    parser.add_argument("--task-file", help="JSON task file with multiple saved jobs.")
-    parser.add_argument("--task-name", action="append", dest="task_names", help="Only run matching task name(s).")
-    parser.add_argument("--run-tasks", action="store_true", help="Run enabled tasks from --task-file once.")
-    parser.add_argument("--schedule-tasks", action="store_true", help="Keep running enabled tasks from --task-file on intervals.")
+    parser.add_argument("--task-file", "--config-file", dest="task_file", help="JSON task/config file with multiple saved jobs.")
+    parser.add_argument("--task-name", "--config-name", action="append", dest="task_names", help="Only run matching task/config name(s).")
+    parser.add_argument("--run-tasks", "--run-configs", action="store_true", dest="run_tasks", help="Run enabled tasks from --task-file once.")
+    parser.add_argument(
+        "--schedule-tasks",
+        "--schedule-configs",
+        action="store_true",
+        dest="schedule_tasks",
+        help="Keep running enabled tasks from --task-file on intervals.",
+    )
+    parser.add_argument("--progress-json", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--self-test", action="store_true", help="Run offline parser tests.")
     return parser
+
+
+CONFIG_VALUE_FLAGS = {
+    "source_match": "--source-match",
+    "site": "--site",
+    "f_cats": "--f-cats",
+    "title_contains": "--title-contains",
+    "title_regex": "--title-regex",
+    "title_match": "--title-match",
+    "max_list_pages": "--max-list-pages",
+    "max_galleries": "--max-galleries",
+    "max_image_pages": "--max-image-pages",
+    "output": "--output",
+    "cookie_file": "--cookie-file",
+    "timeout": "--timeout",
+    "delay": "--delay",
+    "retries": "--retries",
+    "retry_backoff": "--retry-backoff",
+    "download_mode": "--download-mode",
+    "archive_connections": "--archive-connections",
+    "gallery_workers": "--gallery-workers",
+    "page_workers": "--page-workers",
+    "hosts": "--hosts",
+    "proxy_mode": "--proxy-mode",
+    "proxy_url": "--proxy-url",
+    "job_name": "--job-name",
+}
+CONFIG_BOOL_FLAGS = {
+    "html_pages": "--html-pages",
+    "original": "--original",
+    "overwrite": "--overwrite",
+    "keep_going": "--keep-going",
+    "dry_run": "--dry-run",
+    "list_failures": "--list-failures",
+}
+CONFIG_SOURCE_TYPES = {
+    "search": "--search",
+    "keywords": "--search",
+    "uploader": "--uploader",
+    "tag": "--tag",
+    "list url": "--url",
+    "list-url": "--url",
+    "url": "--url",
+}
+
+
+def config_args_from_object(config: Dict[str, object]) -> List[str]:
+    args: List[str] = []
+
+    raw_conditions = config.get("server_conditions")
+    if isinstance(raw_conditions, list) and raw_conditions:
+        combined_search_terms: List[str] = []
+        for index, condition in enumerate(raw_conditions, start=1):
+            if not isinstance(condition, dict):
+                raise ValueError(f"server_conditions item #{index} must be an object.")
+            source_type = str(condition.get("type") or condition.get("source_type") or "").strip().lower()
+            source_flag = CONFIG_SOURCE_TYPES.get(source_type)
+            if not source_flag:
+                raise ValueError(f"Unknown server condition type: {source_type}")
+            value = condition.get("value")
+            values = split_multi_values(value)
+            if source_type in {"search", "keywords"}:
+                combined_search_terms.extend(values)
+            elif source_type == "tag":
+                prefix = str(condition.get("prefix") or "").strip()
+                raw_tag_value = str(condition.get("tag_value") or "").strip()
+                if prefix and raw_tag_value:
+                    exact = str(condition.get("exact", "1")).lower() not in {"0", "false", "no"}
+                    combined_search_terms.append(format_tag_query(prefix, raw_tag_value, exact))
+                else:
+                    # A Tag condition is an E-Hentai search expression. Keep
+                    # bare legacy values here as search terms as well, so a
+                    # config can use any documented namespace or operator.
+                    combined_search_terms.extend(values)
+            else:
+                for item in values:
+                    args.extend([source_flag, item])
+        if combined_search_terms:
+            args.extend(["--search", " ".join(combined_search_terms)])
+    else:
+        source_type = str(config.get("source_type") or "").strip().lower()
+        source_value = config.get("source_value")
+        if source_type and source_value not in (None, ""):
+            source_flag = CONFIG_SOURCE_TYPES.get(source_type)
+            if not source_flag:
+                raise ValueError(f"Unknown config source_type: {source_type}")
+            for value in split_multi_values(source_value):
+                args.extend([source_flag, value])
+        else:
+            for key in ("search", "uploader", "tag", "url"):
+                value = config.get(key)
+                if value not in (None, ""):
+                    for item in split_multi_values(value):
+                        args.extend([CONFIG_SOURCE_TYPES[key], item])
+                    break
+
+    categories = config.get("categories")
+    if isinstance(categories, list):
+        for category in categories:
+            args.extend(["--category", str(category)])
+    elif isinstance(categories, str) and categories.strip():
+        args.extend(["--category", categories.strip()])
+
+    raw_local_filters = config.get("local_filters")
+    local_filter_keys = set()
+    if isinstance(raw_local_filters, list) and raw_local_filters:
+        for index, condition in enumerate(raw_local_filters, start=1):
+            if not isinstance(condition, dict):
+                raise ValueError(f"local_filters item #{index} must be an object.")
+            filter_type = str(condition.get("type") or "").strip().lower()
+            filter_flag = {"title contains": "--title-contains", "title regex": "--title-regex"}.get(filter_type)
+            if not filter_flag:
+                raise ValueError(f"Unknown local filter type: {filter_type}")
+            for value in split_multi_values(condition.get("value")):
+                args.extend([filter_flag, value])
+            local_filter_keys.add("title_contains" if filter_type == "title contains" else "title_regex")
+
+    for key, flag in CONFIG_VALUE_FLAGS.items():
+        if key in local_filter_keys or (isinstance(raw_conditions, list) and raw_conditions and key == "source_match"):
+            continue
+        value = config.get(key)
+        if value not in (None, ""):
+            if isinstance(value, list):
+                for item in value:
+                    if item not in (None, ""):
+                        args.extend([flag, str(item)])
+            else:
+                args.extend([flag, str(value)])
+
+    for key, flag in CONFIG_BOOL_FLAGS.items():
+        if bool(config.get(key, False)):
+            args.append(flag)
+
+    raw_args = config.get("args")
+    if raw_args is not None:
+        if not isinstance(raw_args, list) or not all(isinstance(item, (str, int, float, bool)) for item in raw_args):
+            raise ValueError("Config args must be a JSON array of strings/numbers/bools.")
+        args.extend(str(item) for item in raw_args)
+    return args
 
 
 def load_task_definitions(path: Path) -> List[Dict[str, object]]:
@@ -1471,23 +2706,33 @@ def load_task_definitions(path: Path) -> List[Dict[str, object]]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"Failed to read task file {path}: {exc}") from exc
-    tasks = data.get("tasks") if isinstance(data, dict) else data
+    defaults: Dict[str, object] = {}
+    if isinstance(data, dict):
+        raw_defaults = data.get("defaults")
+        if isinstance(raw_defaults, dict):
+            defaults = raw_defaults
+        tasks = data.get("configs") or data.get("tasks")
+    else:
+        tasks = data
     if not isinstance(tasks, list):
-        raise ValueError("Task file must be a JSON array or an object with a 'tasks' array.")
+        raise ValueError("Task/config file must be a JSON array or an object with a 'tasks' or 'configs' array.")
     normalized: List[Dict[str, object]] = []
     for index, task in enumerate(tasks, start=1):
         if not isinstance(task, dict):
             raise ValueError(f"Task #{index} must be an object.")
         name = str(task.get("name") or f"task-{index}").strip()
-        raw_args = task.get("args")
-        if not isinstance(raw_args, list) or not all(isinstance(item, (str, int, float, bool)) for item in raw_args):
-            raise ValueError(f"Task '{name}' must define args as a JSON array.")
+        try:
+            task_args = config_args_from_object(defaults) + config_args_from_object(task)
+        except ValueError as exc:
+            raise ValueError(f"Task '{name}' is invalid: {exc}") from exc
+        if not task_args:
+            raise ValueError(f"Task '{name}' must define args or typed config fields.")
         normalized.append(
             {
                 "name": name,
                 "enabled": bool(task.get("enabled", True)),
                 "interval_minutes": float(task.get("interval_minutes", 60)),
-                "args": [str(item) for item in raw_args],
+                "args": task_args,
             }
         )
     return normalized

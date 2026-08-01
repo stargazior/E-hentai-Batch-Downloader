@@ -1,7 +1,8 @@
 param(
   [string]$Python = "",
   [switch]$InstallDeps,
-  [switch]$OneFile
+  [switch]$OneFile,
+  [switch]$Console
 )
 
 $ErrorActionPreference = "Stop"
@@ -102,7 +103,7 @@ $PyInstallerArgs = @(
   "-m", "PyInstaller",
   "--noconfirm",
   "--clean",
-  "--console",
+  $(if ($Console) { "--console" } else { "--windowed" }),
   "--name", $AppName,
   "--workpath", $WorkPath,
   "--distpath", $DistPath,
@@ -137,16 +138,24 @@ $PyInstallerArgs += "eh_batch_gui.py"
 Invoke-Checked $PythonExe $PyInstallerArgs
 
 $ZipPath = Join-Path $ReleaseDir "$AppName-windows-x64.zip"
+$ReleaseAppDir = Join-Path $ReleaseDir "$AppName-windows-x64"
 if (Test-Path $ZipPath) {
   Remove-Item -LiteralPath $ZipPath -Force
 }
+Assert-In-Root -PathToCheck $ReleaseAppDir
+if (Test-Path $ReleaseAppDir) {
+  Remove-Item -LiteralPath $ReleaseAppDir -Recurse -Force
+}
+New-Item -ItemType Directory -Force -Path $ReleaseAppDir | Out-Null
 
 if ($OneFile) {
   $ExePath = Join-Path $DistPath "$AppName.exe"
-  Compress-Archive -Path $ExePath -DestinationPath $ZipPath
+  Copy-Item -LiteralPath $ExePath -Destination $ReleaseAppDir -Force
 } else {
   $AppDir = Join-Path $DistPath $AppName
-  Compress-Archive -Path (Join-Path $AppDir "*") -DestinationPath $ZipPath
+  Copy-Item -Path (Join-Path $AppDir "*") -Destination $ReleaseAppDir -Recurse -Force
 }
 
+Compress-Archive -Path (Join-Path $ReleaseAppDir "*") -DestinationPath $ZipPath
 Write-Host "Built $ZipPath"
+Write-Host "Built $ReleaseAppDir"
